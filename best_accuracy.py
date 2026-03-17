@@ -1,10 +1,10 @@
 # EVOLVE-BLOCK-START
-"""Manual CharXiv inference optimized for Qwen/Qwen3-VL-2B-Instruct."""
+"""Best-accuracy CharXiv inference with a targeted title verifier."""
 
 import re
 
 import torch
-from PIL import Image, ImageEnhance, ImageOps, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from qwen_vl_utils import process_vision_info
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -14,12 +14,14 @@ if torch.cuda.is_available():
 
 _MODEL = None
 _PROCESSOR = None
+_RAW_IMAGE_CACHE = {}
 _IMAGE_CACHE = {}
 _MODEL_NAME = "Qwen/Qwen3-VL-2B-Instruct"
 _MAX_NEW_TOKENS = 32
 
 _NUMBER_RE = re.compile(r"[-+]?(?:[0-9]*[.][0-9]+|[0-9]+)(?:[eE][-+]?[0-9]+)?%?")
 _LAYOUT_RE = re.compile(r"([0-9]+) *(?:by|x) *([0-9]+)", re.IGNORECASE)
+_PANEL_RE = re.compile(r"^\(?[a-zA-Z]\)?$")
 
 _NUMERIC_PHRASES = [
     "difference between consecutive numerical tick values",
@@ -73,38 +75,68 @@ def _get_model():
     return _MODEL, _PROCESSOR
 
 
-def _preprocess_image(image_path):
-    img = Image.open(image_path).convert("RGB")
+def _load_raw_image(image_path):
+    if image_path not in _RAW_IMAGE_CACHE:
+        _RAW_IMAGE_CACHE[image_path] = Image.open(image_path).convert("RGB")
+    return _RAW_IMAGE_CACHE[image_path]
+
+
+def _resize_chart(img, small_target=1600, medium_target=1400, large_cap=2200):
     w, h = img.size
     max_dim = max(w, h)
-
-    # Upscale small charts to improve text readability; cap very large charts.
     if max_dim < 700:
-        scale = 1600 / max_dim
-        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
-    elif max_dim < 960:
-        scale = 1400 / max_dim
-        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
-    elif max_dim > 2600:
-        scale = 2200 / max_dim
-        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
-
-    # Enhance contrast/sharpness for crisp chart text and lines.
-    img = ImageOps.autocontrast(img, cutoff=0.5)
-    img = ImageEnhance.Color(img).enhance(0.98)
-    img = ImageEnhance.Contrast(img).enhance(1.15)
-    img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=170, threshold=2))
-    img = ImageEnhance.Sharpness(img).enhance(1.08)
-    return img
+        scale = small_target / max_dim
+        return img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+    if max_dim < 960:
+        scale = medium_target / max_dim
+        return img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+    if max_dim > 2600:
+        scale = large_cap / max_dim
+        return img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+    return img.copy()
 
 
-def _get_image_inputs(image_path):
-    if image_path not in _IMAGE_CACHE:
-        img = _preprocess_image(image_path)
+def _make_view(image_path, variant="default"):
+    base = _load_raw_image(image_path)
+
+    if variant == "default":
+        img = _resize_chart(base, small_target=1600, medium_target=1400, large_cap=2200)
+        img = ImageOps.autocontrast(img, cutoff=0.5)
+        img = ImageEnhance.Color(img).enhance(0.98)
+        img = ImageEnhance.Contrast(img).enhance(1.15)
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=170, threshold=2))
+        img = ImageEnhance.Sharpness(img).enhance(1.08)
+        return img
+
+    if variant == "title_sharp":
+        img = _resize_chart(base, small_target=1800, medium_target=1600, large_cap=2400)
+        img = ImageOps.autocontrast(img, cutoff=0.3)
+        img = ImageEnhance.Color(img).enhance(0.97)
+        img = ImageEnhance.Contrast(img).enhance(1.22)
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=200, threshold=2))
+        img = ImageEnhance.Sharpness(img).enhance(1.14)
+        return img
+
+    if variant == "title_gray":
+        img = _resize_chart(base, small_target=1850, medium_target=1650, large_cap=2400)
+        img = ImageOps.grayscale(img).convert("RGB")
+        img = ImageOps.autocontrast(img, cutoff=0.2)
+        img = ImageEnhance.Contrast(img).enhance(1.28)
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=190, threshold=2))
+        img = ImageEnhance.Sharpness(img).enhance(1.12)
+        return img
+
+    raise ValueError(f"Unknown view variant: {variant}")
+
+
+def _get_image_inputs(image_path, variant="default"):
+    key = (image_path, variant)
+    if key not in _IMAGE_CACHE:
+        img = _make_view(image_path, variant)
         messages = [{"role": "user", "content": [{"type": "image", "image": img}]}]
         image_inputs, _ = process_vision_info(messages)
-        _IMAGE_CACHE[image_path] = (image_inputs, img)
-    return _IMAGE_CACHE[image_path]
+        _IMAGE_CACHE[key] = (image_inputs, img)
+    return _IMAGE_CACHE[key]
 
 
 def _build_prompt(question):
@@ -125,7 +157,6 @@ def _build_prompt(question):
         "Do not round, estimate, or add approximations.",
     ]
 
-    # Targeted guidance for specific question types.
     if "label of the x-axis" in q or "x-axis label" in q:
         lines.append("For x-axis label questions, answer ONLY the exact axis title text. No extra words.")
         lines.append("If no x-axis title is shown, answer exactly: Not Applicable.")
@@ -149,6 +180,19 @@ def _build_prompt(question):
         lines.append("If there are no plotted data lines, answer exactly: Not Applicable.")
 
     lines.append(f"Question: {question.strip()}")
+    return chr(10).join(lines)
+
+
+def _build_title_probe_prompt(question):
+    lines = [
+        "Use ONLY visible chart evidence.",
+        "Return ONLY the final answer.",
+        "Single line only.",
+        "If the answer is not explicitly visible, answer exactly: Not Applicable.",
+        "Copy the exact plot title text only. If no explicit title exists, answer Not Applicable.",
+        "If the title is only a letter or panel marker such as (a), answer exactly: Not Applicable.",
+        f"Question: {question.strip()}",
+    ]
     return chr(10).join(lines)
 
 
@@ -261,11 +305,8 @@ def _normalize_answer(question, raw_text):
     return _normalize_text_answer(question, candidates)
 
 
-def vlm_inference(image_path, question="Describe this image in detail."):
-    model, processor = _get_model()
-    prompt = _build_prompt(question)
-
-    image_inputs, img = _get_image_inputs(image_path)
+def _run_single(model, processor, image_path, question, prompt, variant="default"):
+    image_inputs, img = _get_image_inputs(image_path, variant)
     messages = [{
         "role": "user",
         "content": [
@@ -274,7 +315,6 @@ def vlm_inference(image_path, question="Describe this image in detail."):
         ],
     }]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
     inputs = processor(text=[text], images=image_inputs, padding=True, return_tensors="pt")
     inputs = inputs.to(model.device)
 
@@ -294,4 +334,42 @@ def vlm_inference(image_path, question="Describe this image in detail."):
     trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     raw_text = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
     return _normalize_answer(question, raw_text)
+
+
+def _is_title_question(question):
+    return "what is its title" in " ".join(question.lower().split())
+
+
+def _looks_like_panel_marker(answer):
+    cleaned = answer.strip()
+    if cleaned == "Not Applicable":
+        return False
+    if _PANEL_RE.fullmatch(cleaned):
+        return True
+    if len(cleaned) <= 3 and cleaned.replace(".", "").replace("-", "").isalpha():
+        return True
+    return False
+
+
+def _title_verifier(model, processor, image_path, question):
+    prompt = _build_title_probe_prompt(question)
+    answers = []
+    for variant in ["default", "title_sharp", "title_gray"]:
+        answers.append(_run_single(model, processor, image_path, question, prompt, variant=variant))
+    if answers[0] == answers[1] == answers[2]:
+        return answers[0]
+    return None
+
+
+def vlm_inference(image_path, question="Describe this image in detail."):
+    model, processor = _get_model()
+    prompt = _build_prompt(question)
+    base_answer = _run_single(model, processor, image_path, question, prompt, variant="default")
+
+    if _is_title_question(question) and _looks_like_panel_marker(base_answer):
+        verified = _title_verifier(model, processor, image_path, question)
+        if verified is not None and verified != base_answer:
+            return verified
+
+    return base_answer
 # EVOLVE-BLOCK-END
