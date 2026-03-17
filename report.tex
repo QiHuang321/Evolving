@@ -1,0 +1,293 @@
+\documentclass{article}
+
+\usepackage{neurips_2024}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{graphicx}
+\setcitestyle{numbers,square}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!8},
+}
+
+\title{Evolving Vision-Language Inference:\\
+An AlphaEvolve-Style Code Optimization System\\
+for Chart Question Answering}
+
+\author{%
+  Qi Huang \\
+  The University of Chicago \\
+  \texttt{qihuang@uchicago.edu}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present an AlphaEvolve-style evolutionary code optimization system applied to
+Vision-Language Model (VLM) inference for chart understanding on the CharXiv
+benchmark. Starting from a naive baseline achieving 38.3\% accuracy, we first
+manually optimize the inference pipeline through prompt engineering, structured
+output normalization, and image caching, reaching 53.9\% accuracy with a
+13$\times$ speed improvement. We then implement an evolutionary system that uses
+an LLM (GPT) as a mutation operator over a maintained population of candidate
+programs, automatically discovering improvements without further human
+intervention. The evolved instruct variant achieves 60.2\% accuracy---a
+21.9 percentage point improvement over the baseline---demonstrating that
+automated code evolution can meaningfully outperform manual optimization alone.
+\end{abstract}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Introduction}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+Chart question answering is a challenging multimodal task requiring a model to
+read visual artifacts (axes, legends, data lines) and produce exact short-form
+answers. The CharXiv benchmark \cite{charxiv} evaluates models on descriptive
+and reasoning questions about scientific charts using exact-string comparison,
+making answer formatting as important as perceptual accuracy.
+
+AlphaEvolve \cite{alphaevolve} demonstrates that an LLM acting as a mutation
+operator inside an evolutionary loop can automatically improve algorithmic code
+beyond what human engineering achieves. We apply its core ideas to the VLM
+inference pipeline: the ``gene'' being evolved is the Python function
+\texttt{vlm\_inference}, and the fitness function is exact-match accuracy on a
+128-sample CharXiv development subset.
+
+We fix the answering model to Qwen3-VL-2B \cite{qwen} (Instruct and Thinking
+variants) and vary only the surrounding inference code: prompting strategy,
+image preprocessing, and post-processing normalization. This clean separation
+makes the evolutionary search tractable and interpretable.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Task Setup}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\paragraph{Benchmark.}
+CharXiv contains 2{,}323 charts from scientific papers with descriptive and
+reasoning questions. We use the descriptive validation split and restrict
+development/evolution to the first 128 examples as defined in
+\texttt{evaluate.py}.
+
+\paragraph{Models.}
+We use \texttt{Qwen/Qwen3-VL-2B-Instruct} (direct answer) and
+\texttt{Qwen/Qwen3-VL-2B-Thinking} (chain-of-thought reasoning) throughout.
+Switching to larger variants is not permitted. Both models are loaded in
+\texttt{bfloat16} with \texttt{device\_map="auto"}.
+
+\paragraph{Reproducibility.}
+Greedy decoding (\texttt{do\_sample=False}) is enforced in all submitted
+scripts. The mutation LLM is OpenAI \texttt{gpt-5.2-codex}; Gemini Flash was
+initially attempted but the available project had zero usable
+\texttt{generate\_content} quota, so the system was switched to OpenAI.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Manual Optimization}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The naive baseline (\texttt{starting\_scripts.py}) loads Qwen3-VL-2B-Instruct,
+formats a single-message chat prompt, and generates up to 128 tokens. It
+achieves 38.3\% accuracy at 3.48 s/query.
+
+Manual inspection of failure cases showed three dominant error types: (1) the
+model produces verbose justifications rather than bare answers; (2) numbers are
+formatted with commas or units that the evaluator does not expect; (3) the model
+guesses when the chart does not contain evidence, instead of answering ``Not
+Applicable''. We address each with targeted changes.
+
+\paragraph{Prompt engineering.}
+We replace the default prompt with a structured instruction that explicitly
+demands a single-line exact answer, lists the expected format for each question
+type (number, Yes/No, \textit{n} by \textit{m}, comma-separated legend labels),
+and adds question-conditional clauses (e.g.\ ``if no continuous legend exists,
+answer exactly: Not Applicable'').
+
+\paragraph{Output normalization.}
+A post-processing layer strips common prefixes (``The answer is'', ``The
+x-axis label is''), extracts numbers with a regex, maps layout tokens to the
+canonical \textit{n} by \textit{m} form, and collapses ``Not Applicable''
+synonyms.
+
+\paragraph{Speed optimizations.}
+Image inputs and processed tensors are cached per file path, eliminating
+redundant preprocessing for the multiple questions that share the same chart.
+\texttt{max\_new\_tokens} is reduced from 128 to 32, and
+\texttt{torch.inference\_mode()} replaces \texttt{torch.no\_grad()}.
+
+\paragraph{Thinking model.}
+For the Thinking variant, an empty \texttt{<think></think>} block is injected
+into the prompt to suppress verbose reasoning chains and force a concise final
+answer.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Evolution System Design}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+Both \texttt{evolve\_instruct.py} and \texttt{evolve\_thinking.py} implement
+the three core AlphaEvolve components.
+
+\paragraph{LLM-based mutation.}
+At each generation, the system sends the current parent program (full source of
+the \texttt{EVOLVE-BLOCK} region) along with its accuracy and speed to
+\texttt{gpt-5.2-codex}, together with up to two other population members as
+inspiration and a randomly chosen mutation strategy from a curated list of eight
+options (e.g.\ ``improve numeric extraction'', ``improve image preprocessing'',
+``improve Not Applicable detection''). The model returns a fenced Python block
+which the system validates syntactically before evaluation.
+
+\paragraph{Population management.}
+We maintain an island model with 2 islands of 4 programs each (8 total). Every
+5 generations the best individual from each island migrates to a random other
+island, providing diversity without sacrificing convergence within each island.
+
+\paragraph{Selection and elitism.}
+Tournament selection ($k=3$) within each island chooses the parent for
+mutation. A composite fitness score
+$f = 0.9 \times \text{accuracy} + 0.1 \times \text{speed\_bonus}$
+is used for ranking, keeping accuracy dominant. The globally best program is
+checkpointed to \texttt{evolved\_instruct.py} (or \texttt{evolved\_thinking.py})
+whenever a new maximum is found.
+
+\paragraph{Evolution loop.}
+Each run performs 40 generations, alternating between islands. Invalid Python
+mutations are discarded; programs with zero accuracy (indicating a runtime
+error) are also discarded. Full per-candidate results are appended under
+\texttt{artifacts/evolution\_logs/} for post-hoc analysis.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Results}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+Table~\ref{tab:results} reports accuracy and average inference time per query
+on the 128-sample development subset for the five primary systems.
+
+\begin{table}[h]
+\centering
+\caption{Accuracy and speed on the 128-sample CharXiv development subset.
+Timing is wall-clock per query on the same GPU.}
+\label{tab:results}
+\begin{tabular}{lrrl}
+\toprule
+Variant & Accuracy & Time (s/query) & Notes \\
+\midrule
+\texttt{starting\_scripts} & 0.3828 & 3.4841 & naive baseline \\
+\texttt{manual\_instruct}  & 0.5391 & \textbf{0.2689} & +15.6 pp; 13$\times$ faster \\
+\texttt{manual\_thinking}  & 0.5078 & 0.2752 & thinking model, suppressed reasoning \\
+\texttt{evolved\_instruct} & \textbf{0.6016} & 0.3100 & best accuracy, best overall \\
+\texttt{evolved\_thinking} & 0.5469 & 0.2714 & evolved improvement over manual thinking \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Manual vs.\ baseline.}
+Manual optimization delivers a 15.6 pp accuracy gain and reduces latency by
+roughly 13$\times$, primarily through structured prompting and caching.
+
+\paragraph{Evolution vs.\ manual.}
+The evolved instruct variant adds a further 6.3 pp over manual instruct,
+reaching 60.2\%. This gain comes from richer image preprocessing (adaptive
+upscaling, contrast enhancement, unsharp masking) and tighter prompt
+constraints discovered by the mutation LLM. Notably, these image-level changes
+were not part of the manual baseline and would have been non-obvious to add by
+hand.
+
+\paragraph{Instruct vs.\ Thinking.}
+The Instruct model consistently outperforms the Thinking model across both
+manual and evolved variants. The Thinking model's chain-of-thought mechanism is
+a liability for exact-match short-answer tasks: even with reasoning suppressed,
+it is more sensitive to prompt phrasing and occasionally produces longer
+responses that fail normalization.
+
+\paragraph{Best deliverables.}
+Based on the above:
+\begin{itemize}
+  \item \textbf{Best accuracy:} \texttt{evolved\_instruct} (0.6016)
+  \item \textbf{Best speed:} \texttt{manual\_instruct} (0.2689 s/query, while still
+        achieving 53.9\% accuracy)
+  \item \textbf{Best overall:} \texttt{evolved\_instruct} (highest composite
+        score $f = 0.6325$)
+\end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Analysis}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\paragraph{What worked.}
+Exact-match-oriented prompting had the highest single-change impact. Many
+baseline failures were pure formatting failures: the model knew the correct
+value but wrapped it in a sentence. Structured output normalization provided
+additional gains at essentially zero computational cost. Seeding evolution from
+an already-optimized manual baseline (rather than the naive starter) was
+critical: early generations can refine rather than recover basic competence.
+
+\paragraph{What did not work.}
+A non-trivial fraction of GPT mutations produced syntactically valid but
+semantically broken code (zero accuracy at runtime). More robust sanity-checking
+(e.g.\ a one-sample pre-screen) could save significant evaluation time. The
+Thinking model was more fragile and expensive to evolve: its generation length
+variability made latency less predictable and some mutations accidentally
+re-enabled verbose reasoning, sharply hurting exact-match accuracy.
+
+\paragraph{Causal analysis.}
+A limitation of the current evolution system is that each mutation typically
+changes multiple components simultaneously (prompt, preprocessing, normalization)
+making it impossible to attribute an accuracy change to a specific intervention.
+Applying a single-variable ablation study in the manual phase---or designing
+mutations that change exactly one component per generation---would enable proper
+causal attribution of each technique's contribution.
+
+\paragraph{Future directions.}
+Increasing the number of generations, maintaining a larger population, or using
+a more powerful mutation model could push accuracy further. Incorporating
+reasoning-type CharXiv questions alongside descriptive ones would test
+generalization. A structured mutation operator that performs targeted single-factor
+interventions, guided by causal inference, could improve both sample efficiency
+and interpretability of the evolution process.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Conclusion}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+We implemented an AlphaEvolve-style evolutionary code optimization system for
+VLM chart inference and showed that it improves accuracy by 21.9 pp over the
+naive baseline and 6.3 pp over careful manual optimization. The results confirm
+that automated code evolution, seeded with human insight, is a practically
+useful technique for optimizing structured inference pipelines where the model
+weights are fixed.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{alphaevolve}
+Google DeepMind.
+\newblock AlphaEvolve: A Gemini-powered coding agent for designing advanced
+algorithms, 2025.
+\newblock \url{https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/}
+
+\bibitem{charxiv}
+Z.~Wang et al.
+\newblock CharXiv: Charting Gaps in Realistic Chart Understanding in Multimodal
+LLMs.
+\newblock \textit{NeurIPS}, 2024.
+
+\bibitem{qwen}
+Qwen Team.
+\newblock Qwen3 Technical Report, 2025.
+\newblock \url{https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct}
+
+\end{thebibliography}
+
+\end{document}

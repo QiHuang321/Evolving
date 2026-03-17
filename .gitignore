@@ -1,0 +1,30 @@
+.DS_Store
+.venv/
+.hf-cache/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# LaTeX build products
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
+
+# Generated artifacts
+artifacts/
+notes/
