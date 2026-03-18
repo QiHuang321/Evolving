@@ -16,5 +16,5 @@ run_eval manual_thinking     # expected: 0.5078
 run_eval evolved_instruct    # expected: 0.6094
 run_eval evolved_thinking    # expected: 0.5547
 run_eval best_accuracy       # expected: 0.7969
-run_eval best_speed          # expected: 0.5781
+run_eval best_speed          # expected: 0.5781 (batched, ~0.186 s/q)
 run_eval best_overall        # expected: 0.7813

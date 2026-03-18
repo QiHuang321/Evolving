@@ -1,9 +1,18 @@
-"""Evaluator for VLM inference using CharXiv benchmark."""
+"""Evaluator for VLM inference using CharXiv benchmark.
+
+Supports two inference modes:
+  1. vlm_inference(image_path, question)          — single-query (all modules)
+  2. vlm_inference_batch(image_path, questions)    — batched per-image (optional)
+
+If the loaded module exposes vlm_inference_batch, the evaluator groups queries
+by image and calls the batch path for better throughput.
+"""
 import importlib
 import sys
 import json
 import time
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 
 CHARXIV_PATH = Path(__file__).parent / "charxiv"
@@ -28,18 +37,43 @@ def evaluate(program):
 
     num_errors = 0
     start_time = time.time()
-    for query_key, query in queries.items():
-        try:
-            response = program.vlm_inference(
-                image_path=query["figure_path"],
-                question=query["question"],
-            )
-            query["response"] = response
-        except Exception as e:
-            print(f"Error on {query_key}: {e}")
-            traceback.print_exc()
-            query["response"] = "ERROR"
-            num_errors += 1
+
+    batch_fn = getattr(program, "vlm_inference_batch", None)
+
+    if batch_fn is not None:
+        # ── Batched path: group queries by image, call batch function ──
+        groups = OrderedDict()           # image_path -> [(query_key, question)]
+        for query_key, query in queries.items():
+            img = query["figure_path"]
+            groups.setdefault(img, []).append((query_key, query["question"]))
+
+        for img_path, items in groups.items():
+            questions = [q for _, q in items]
+            try:
+                responses = batch_fn(image_path=img_path, questions=questions)
+                for (qk, _), resp in zip(items, responses):
+                    queries[qk]["response"] = resp
+            except Exception as e:
+                print(f"Batch error on {img_path}: {e}")
+                traceback.print_exc()
+                for qk, _ in items:
+                    queries[qk]["response"] = "ERROR"
+                num_errors += len(items)
+    else:
+        # ── Single-query fallback ──
+        for query_key, query in queries.items():
+            try:
+                response = program.vlm_inference(
+                    image_path=query["figure_path"],
+                    question=query["question"],
+                )
+                query["response"] = response
+            except Exception as e:
+                print(f"Error on {query_key}: {e}")
+                traceback.print_exc()
+                query["response"] = "ERROR"
+                num_errors += 1
+
     total_time = time.time() - start_time
 
     correct = 0
