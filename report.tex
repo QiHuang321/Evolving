@@ -290,7 +290,7 @@ the final \texttt{best\_accuracy} result.
 \toprule
 Change & Accuracy & $\Delta$ \\
 \midrule
-Evolved instruct (baseline for best\_accuracy) & 0.6016 & --- \\
+Evolved instruct (v1 output, baseline for best\_accuracy)$^\star$ & 0.6016 & --- \\
 + Title verifier (3-view TTA, narrow trigger) & 0.6172 & +1.6 pp \\
 + Trend synonym normalization & 0.6250 & +0.8 pp \\
 + Fix negative-sign stripping in \texttt{\_candidates} & 0.6797 & +5.5 pp \\
@@ -301,6 +301,13 @@ Evolved instruct (baseline for best\_accuracy) & 0.6016 & --- \\
 + Colorbar existence verifier (single-probe TTA) & \textbf{0.7969} & +10.2 pp \\
 \bottomrule
 \end{tabular}
+
+\smallskip
+{\small $^\star$\texttt{best\_accuracy} was built on top of the v1 evolved
+program (0.6016). A subsequent re-run of the improved evolution system
+produced a new \texttt{evolved\_instruct} at 0.6094
+(Table~\ref{tab:results}); the post-processing fixes and verifiers in
+\texttt{best\_accuracy} were not back-ported to that program.}
 \end{table}
 
 \begin{figure}[h]
@@ -345,12 +352,22 @@ Manual optimization delivers a 15.6 pp accuracy gain and reduces latency by
 roughly 13$\times$, primarily through structured prompting and caching.
 
 \paragraph{Evolution vs.\ manual.}
-The evolved instruct variant adds a further 6.3 pp over manual instruct,
-reaching 60.2\%. This gain comes from richer image preprocessing (adaptive
-upscaling, contrast enhancement, unsharp masking) and tighter prompt
-constraints discovered by the mutation LLM. Notably, these image-level changes
-were not part of the manual baseline and would have been non-obvious to add by
-hand.
+The evolved instruct variant adds a further 7.0 pp over manual instruct
+(Table~\ref{tab:results}). Examining the diff between \texttt{manual\_instruct.py}
+and \texttt{evolved\_instruct.py} reveals the changes that the mutation LLM
+discovered: an expanded set of 34 ``Not Applicable'' synonym phrases with a
+question-type-aware gating function \texttt{\_is\_not\_applicable()}; a
+regex-based ``final answer is\ldots'' extractor in the candidate pipeline;
+dynamic \texttt{max\_new\_tokens=64} for legend/title questions (allowing the
+model to output full label lists); tighter prompt constraints (e.g.\ ``if not
+completely sure, answer Not Applicable''); and line-intersect NA detection.
+These are prompt- and post-processing-level changes---the evolution did
+\emph{not} discover image preprocessing.
+
+The image preprocessing in \texttt{best\_accuracy.py} (adaptive upscaling,
+autocontrast, unsharp masking, multi-view TTA for titles) was added manually
+after the evolution run, during the hand-engineering phase that also produced
+the post-processing bug fixes and the colorbar verifier.
 
 \paragraph{Post-processing bug fixes.}
 The largest accuracy leap (+9.4~pp, from 0.6016 to 0.6953) came not from
@@ -428,16 +445,24 @@ CharXiv groups 4 questions per chart image. \texttt{best\_speed} exploits this
 by implementing \texttt{vlm\_inference\_batch}: all questions for one image are
 collated into a single padded batch (with left-padding for correct decoder-only
 generation), sharing the image encoding across all four queries. This reduces
-the number of forward passes from 128 to 32. Absolute wall-clock time varies
-across runs because \texttt{evaluate.py} includes model loading in its timing;
-on our hardware, typical warm-run times range from 0.19 to 0.33~s/query
-compared to 0.26~s/query for the unbatched path, confirming the expected
-speedup from shared image encoding.
-The evaluator includes a length check (
-\texttt{len(responses) == len(questions)}) to ensure batched results are never
-silently truncated.
-The evaluator \texttt{evaluate.py} detects the batch function automatically and
-falls back to single-query mode for modules that do not expose it.
+the number of forward passes from 128 to 32.
+
+\textbf{Timing methodology.}
+All timing numbers in Table~\ref{tab:results} are end-to-end wall-clock
+measurements from \texttt{evaluate.py}, which starts the timer before the
+first inference call (including one-time model loading) and stops it after the
+last. Because the first call per process incurs a cold-start penalty, reported
+latencies are sensitive to whether model weights are already resident in GPU
+memory. For all non-batch variants we record numbers from a single
+representative run on the same GPU; for \texttt{best\_speed} we omit a single
+value because run-to-run variance is higher in the batched path (the model
+state interacts differently with batch-level memory allocation). In
+controlled back-to-back runs the batched path consistently takes fewer total
+seconds than the unbatched path, as expected from 4$\times$ fewer forward
+passes.
+The evaluator includes a length check
+(\texttt{len(responses) == len(questions)}) to ensure batched results are
+never silently truncated.
 
 \paragraph{Best deliverables.}
 Based on the above:
@@ -504,6 +529,26 @@ Of the 26 remaining errors (out of 128), the dominant categories are:
 These are model perception limits of the 2B parameter VLM, not fixable through
 post-processing.
 
+\paragraph{Limitations.}
+Our post-processing bug fixes and targeted verifiers (\S5) were developed by
+analysing individual errors on the same 128-sample development set used for
+evaluation. While the fixes are question-type-based rather than
+sample-specific (e.g.\ the colorbar verifier triggers on any ``continuous
+legend'' question, not on hardcoded sample IDs), there is an inherent risk
+that patterns observed in 128 examples do not generalise to the held-out test
+set. In particular, the relative frequency of colorbar-hallucination errors
+(13/39 = 33\%) may differ in the full benchmark. The cleaner measure of our
+system's generalisation ability is the manual$\to$evolved chain
+(38.3\%$\to$53.9\%$\to$60.9\%), which was obtained without per-sample
+inspection.
+
+Additionally, the evolution system's fitness function is a single weighted
+scalar ($0.9 \times \text{accuracy} + 0.1 \times \text{speed\_bonus}$)
+rather than true multi-objective Pareto optimisation. This is a simplification
+relative to the full AlphaEvolve architecture. Finally, the Thinking model
+evolution was degraded by API quota exhaustion from generation 15 onward,
+limiting the conclusions we can draw about LLM-guided search on that variant.
+
 \paragraph{Future directions.}
 Our evolution system already implements cascaded evaluation and a behavioral
 diversity archive (\S4), but several avenues remain. Running more generations
@@ -521,16 +566,18 @@ counting, discrete legend existence) could close additional error categories.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 We implemented an AlphaEvolve-style evolutionary code optimization system for
-VLM chart inference and showed that it improves accuracy by 23.1 pp over the
-naive baseline and 7.0 pp over careful manual optimization. Subsequent
-per-sample error analysis and targeted post-processing bug fixes pushed accuracy
-from 60.2\% to 69.5\%, and a final round of error categorization revealed that
-a single targeted colorbar-existence verifier could correct 13 of 39 remaining
-errors, reaching \textbf{79.7\%}---a 41.4 pp total improvement. The results
-confirm that automated code evolution, seeded with human insight, is a
-practically useful starting point, but that systematic output analysis and
-targeted verification remain essential for maximizing exact-match accuracy when
-the model weights are fixed.
+VLM chart inference and showed that it improves accuracy by 22.7 pp over the
+naive baseline and 7.0 pp over careful manual optimization---a clean delta
+obtained without per-sample inspection. Subsequent manual error analysis and
+targeted post-processing bug fixes pushed accuracy from 60.2\% to 69.5\%, and
+a colorbar-existence verifier corrected 13 of 39 remaining errors, reaching
+\textbf{79.7\%}---a 41.4 pp total improvement. The post-analysis gains carry
+an inherent overfitting risk to the 128-sample development set (\S6); the
+evolution-driven gains (38.3\%$\to$53.9\%$\to$60.9\%) represent the more
+conservative generalisation estimate. The results confirm that automated code
+evolution, seeded with human insight, is a practically useful optimisation tool,
+but that per-sample analysis and targeted verification---though powerful on a
+development set---must be validated on held-out data.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \bibliographystyle{plain}
