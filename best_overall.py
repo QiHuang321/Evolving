@@ -1,5 +1,7 @@
-# EVOLVE-BLOCK-START
-"""Best-overall CharXiv inference: evolved_instruct + post-processing bug fixes."""
+"""Best-overall submission: evolved code + post-processing bug fixes + colorbar verifier (no title TTA).
+
+Accuracy: 0.7813 (100/128) | Avg time: 0.305 s/query
+"""
 
 import re
 
@@ -392,4 +394,3 @@ def vlm_inference(image_path, question="Describe this image in detail."):
             return "Not Applicable"
 
     return base_answer
-# EVOLVE-BLOCK-END

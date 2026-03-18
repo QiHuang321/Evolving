@@ -1,5 +1,8 @@
 # EVOLVE-BLOCK-START
-"""Manual CharXiv inference optimized for Qwen/Qwen3-VL-2B-Thinking."""
+"""Best evolved program (Thinking): output from evolve_thinking.py (hit API quota at gen 15).
+
+Accuracy: 0.5547 (71/128) | Avg time: 0.296 s/query
+"""
 
 import re
 

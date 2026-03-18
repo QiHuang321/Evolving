@@ -1,5 +1,8 @@
 # EVOLVE-BLOCK-START
-"""Manual CharXiv inference optimized for Qwen/Qwen3-VL-2B-Instruct."""
+"""Best evolved program (Instruct): generation 40 output from evolve_instruct.py.
+
+Accuracy: 0.6094 (78/128) | Avg time: 0.261 s/query
+"""
 
 import re
 

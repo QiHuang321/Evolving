@@ -1,5 +1,7 @@
-# EVOLVE-BLOCK-START
-"""Best-accuracy CharXiv inference with a targeted title verifier."""
+"""Best-accuracy submission: evolved code + 5 post-processing bug fixes + title & colorbar verifiers.
+
+Accuracy: 0.7969 (102/128) | Avg time: 0.307 s/query
+"""
 
 import re
 
@@ -494,4 +496,3 @@ def vlm_inference(image_path, question="Describe this image in detail."):
             return verified
 
     return base_answer
-# EVOLVE-BLOCK-END

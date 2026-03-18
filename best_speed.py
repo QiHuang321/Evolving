@@ -1,6 +1,7 @@
-# EVOLVE-BLOCK-START
+"""Best-speed submission: minimal prompt, no image preprocessing, expanded NA detection.
 
-"""Best-speed CharXiv inference: lightweight prompt, no image preprocessing, with post-processing fixes."""
+Accuracy: 0.5781 (74/128) | Avg time: 0.261 s/query
+"""
 
 import re
 
@@ -305,5 +306,3 @@ def vlm_inference(image_path, question="Describe this image in detail."):
     trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     raw_text = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
     return _normalize_answer(question, raw_text)
-
-# EVOLVE-BLOCK-END
