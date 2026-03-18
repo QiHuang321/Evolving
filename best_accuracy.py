@@ -310,6 +310,22 @@ def _normalize_answer(question, raw_text):
                 return "No"
         return "Not Applicable"
 
+    # For legend count questions, if model outputs a comma-separated label list
+    # instead of a count, deduplicate and return the count.
+    if "how many discrete labels are there in the legend" in q:
+        for candidate in candidates:
+            if _looks_not_applicable(candidate):
+                return "Not Applicable"
+            # If candidate contains commas, it's a label list; count unique labels.
+            if ',' in candidate:
+                parts = [p.strip() for p in candidate.split(',') if p.strip()]
+                if parts:
+                    return str(len(set(parts)))
+            matches = _NUMBER_RE.findall(candidate.replace(",", ""))
+            if matches:
+                return matches[-1].rstrip("%")
+        return "Not Applicable"
+
     if any(phrase in q for phrase in _NUMERIC_PHRASES):
         # For tick value questions (leftmost/rightmost/lowest/highest), ticks can
         # be text strings (e.g. "SSM", "Heter-unaware"), not only numbers.
@@ -322,6 +338,9 @@ def _normalize_answer(question, raw_text):
         if is_positional_tick and candidates:
             first = candidates[0] if len(candidates) == 1 else candidates[-1]  # last = original raw
             raw_clean = first.strip()
+            # Preserve caret scientific notation like 10^-6, 10^1
+            if raw_clean and '^' in raw_clean and re.fullmatch(r'[-+]?[0-9]+\^[-+]?[0-9]+', raw_clean):
+                return raw_clean
             # If it has letters and isn't pure NA, it's likely a text tick label
             if raw_clean and any(c.isalpha() for c in raw_clean) and not _looks_not_applicable(raw_clean):
                 has_pure_number = bool(re.fullmatch(r'[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?%?', raw_clean))
