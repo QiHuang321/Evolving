@@ -6,6 +6,13 @@ Identical architecture to evolve_instruct.py with the following differences:
   - Model: Qwen/Qwen3-VL-2B-Thinking
   - Mutation prompts reference thinking-model specifics (think blocks, budgets)
 
+Core components:
+  - LLM-based mutation: dual-mode (full-block rewrite + focused/diff-based)
+  - Population management: island model + behavioral diversity archive
+  - Evolution loop with tournament selection, elitism, and cascaded evaluation
+  - Cascaded evaluation: 1-sample crash check → 16-sample pre-screen → full 128
+  - Feature-aware archive: maintains diverse programs indexed by per-query behavior
+
 Usage:
     python evolve_thinking.py
 
@@ -49,6 +56,13 @@ EVAL_NUM_SAMPLES = 128
 BLOCK_START = "# EVOLVE-BLOCK-START"
 BLOCK_END   = "# EVOLVE-BLOCK-END"
 
+# Cascaded evaluation settings
+PRESCREEN_SAMPLES = 16
+PRESCREEN_THRESHOLD = 0.7
+
+# Dual-mode mutation
+DIFF_MUTATION_PROB = 0.5
+
 # ── Data structures ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -62,11 +76,15 @@ class Program:
     island: int = 0
     parent_scores: list = field(default_factory=list)
     mutation_prompt: str = ""
+    mutation_mode: str = "full"
     eval_error: str = ""
+    behavior: tuple = ()
 
     def to_dict(self):
         d = asdict(self)
         del d["code"]
+        if d.get("behavior"):
+            d["behavior"] = "".join(str(b) for b in d["behavior"])
         return d
 
 
@@ -91,8 +109,10 @@ def _get_queries():
     return _CACHED_QUERIES, _CACHED_GT
 
 
-def evaluate_program(program: Program) -> Program:
+def evaluate_program(program: Program, parent_accuracy: float = 0.0) -> Program:
+    """Cascaded evaluation: crash check → pre-screen → full eval."""
     queries, gt_data = _get_queries()
+    query_keys = list(queries.keys())
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, dir=str(Path(__file__).parent)
@@ -105,38 +125,106 @@ def evaluate_program(program: Program) -> Program:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
+        responses = {}
         num_errors = 0
         start_time = time.time()
 
-        for query_key, query in queries.items():
+        # ── Phase 1: Crash check (1 sample) ──
+        if parent_accuracy > 0:
+            first_key = query_keys[0]
+            first_q = queries[first_key]
             try:
-                response = mod.vlm_inference(
-                    image_path=query["figure_path"],
-                    question=query["question"],
+                resp = mod.vlm_inference(
+                    image_path=first_q["figure_path"],
+                    question=first_q["question"],
                 )
-                query["response"] = response
+                if not isinstance(resp, str):
+                    raise ValueError(f"non-string response: {type(resp)}")
+                responses[first_key] = resp
             except Exception as e:
-                query["response"] = "ERROR"
+                program.accuracy = 0.0
+                program.avg_time = 999.0
+                program.score = 0.0
+                program.eval_error = f"crash on first sample: {e}"
+                print(f"  [safety] Crash on sample 1: {e}")
+                return program
+
+        # ── Phase 2: Pre-screen ──
+        if parent_accuracy > 0:
+            for key in query_keys[:PRESCREEN_SAMPLES]:
+                if key in responses:
+                    continue
+                try:
+                    resp = mod.vlm_inference(
+                        image_path=queries[key]["figure_path"],
+                        question=queries[key]["question"],
+                    )
+                    responses[key] = resp
+                except Exception:
+                    responses[key] = "ERROR"
+                    num_errors += 1
+
+            pre_correct = 0
+            pre_total = 0
+            for key in query_keys[:PRESCREEN_SAMPLES]:
+                figure_id, subq_idx = key.split("_")
+                gt_entry = gt_data.get(figure_id)
+                if gt_entry is None:
+                    continue
+                gt_answer = gt_entry["answers"][int(subq_idx)]
+                if str(responses.get(key, "ERROR")).strip().lower() == gt_answer.lower():
+                    pre_correct += 1
+                pre_total += 1
+
+            pre_acc = pre_correct / pre_total if pre_total > 0 else 0.0
+            threshold = parent_accuracy * PRESCREEN_THRESHOLD
+            if pre_acc < threshold:
+                elapsed = time.time() - start_time
+                program.accuracy = pre_acc
+                program.avg_time = elapsed / pre_total if pre_total > 0 else 999.0
+                program.score = 0.0
+                program.eval_error = f"prescreen fail: {pre_acc:.3f} < {threshold:.3f}"
+                print(f"  [prescreen] FAIL: {pre_acc:.3f} < {threshold:.3f}")
+                return program
+            else:
+                print(f"  [prescreen] PASS: {pre_acc:.3f} >= {threshold:.3f}")
+
+        # ── Phase 3: Full evaluation ──
+        for key in query_keys:
+            if key in responses:
+                continue
+            try:
+                resp = mod.vlm_inference(
+                    image_path=queries[key]["figure_path"],
+                    question=queries[key]["question"],
+                )
+                responses[key] = resp
+            except Exception:
+                responses[key] = "ERROR"
                 num_errors += 1
 
         total_time = time.time() - start_time
 
         correct = 0
         total = 0
-        for query_key, query in queries.items():
-            if "response" not in query:
-                continue
-            figure_id, subq_idx = query_key.split("_")
+        behavior_bits = []
+        for key in query_keys:
+            figure_id, subq_idx = key.split("_")
             gt_entry = gt_data.get(figure_id)
             if gt_entry is None:
                 continue
             gt_answer = gt_entry["answers"][int(subq_idx)]
-            if query["response"].strip().lower() == gt_answer.lower():
+            resp = str(responses.get(key, "ERROR"))
+            is_correct = resp.strip().lower() == gt_answer.lower()
+            if is_correct:
                 correct += 1
+            behavior_bits.append(1 if is_correct else 0)
             total += 1
 
         program.accuracy = correct / total if total > 0 else 0.0
         program.avg_time = total_time / total if total > 0 else 999.0
+        program.behavior = tuple(behavior_bits)
+
         baseline_time = 3.5
         speed_bonus = max(0.0, min(1.0, (baseline_time - program.avg_time) / baseline_time))
         program.score = 0.9 * program.accuracy + 0.1 * speed_bonus
@@ -190,6 +278,19 @@ def _extract_python_from_response(text: str) -> Optional[str]:
     if matches:
         return max(matches, key=len).strip()
     return text.strip()
+
+
+def _pick_random_function(block: str) -> Optional[str]:
+    """Pick a random function name from the EVOLVE-BLOCK for targeted mutation."""
+    try:
+        tree = ast.parse(block)
+        funcs = [node.name for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef)]
+        if funcs:
+            return random.choice(funcs)
+    except SyntaxError:
+        pass
+    return None
 
 
 # ── OpenAI mutation operator ─────────────────────────────────────────────────────
@@ -247,9 +348,62 @@ Common answer formats:
 """
 
 
-def mutate(parent: Program, generation: int, population: list, openai_client) -> Optional[Program]:
+def _build_focused_mutation_prompt(parent: Program, generation: int,
+                                    other_programs: list, target_function: str) -> str:
+    """Focused/diff-style mutation prompt targeting a single function."""
+    other_examples = ""
+    if other_programs:
+        examples = random.sample(other_programs, min(2, len(other_programs)))
+        for i, p in enumerate(examples):
+            other_examples += f"\n--- Example {i+1} (score={p.score:.4f}) ---\n{p.block}\n"
+
+    return f"""You are an expert Python programmer making a SURGICAL, TARGETED improvement to a VLM inference function for the CharXiv benchmark.
+
+## Task
+CharXiv uses **exact-match** string comparison (case-insensitive). The model is **Qwen3-VL-2B-Thinking** (chain-of-thought in `<think>...</think>` tags).
+
+## Current program (score={parent.score:.4f}, accuracy={parent.accuracy:.4f})
+```python
+{parent.block}
+```
+
+## YOUR MISSION
+Make a **small, focused change** to ONLY the `{target_function}` function (or its immediate helpers).
+Do NOT rewrite the entire program. Keep everything else EXACTLY as-is.
+The change should be roughly 1-15 lines of modification.
+
+## Other programs for inspiration{other_examples if other_examples else " (none)"}
+
+## Rules
+1. Output the COMPLETE EVOLVE-BLOCK code (all functions), but the ONLY changes should be in/around `{target_function}`.
+2. Keep `_MODEL_NAME = "Qwen/Qwen3-VL-2B-Thinking"` unchanged.
+3. Use `do_sample=False` (greedy decoding).
+4. Do NOT swap to a larger model.
+5. Valid Python only.
+6. Wrap output: ```python ... ```
+"""
+
+
+def mutate(parent: Program, generation: int, population: list, openai_client,
+           archive_programs: Optional[list] = None) -> Optional[Program]:
+    """Dual-mode mutation: full-block rewrite or focused (diff-like)."""
     others = [p for p in population if p is not parent and p.score is not None]
-    prompt = _build_mutation_prompt(parent, generation, others)
+    if archive_programs:
+        others = others + [p for p in archive_programs if p is not parent]
+
+    use_focused = random.random() < DIFF_MUTATION_PROB
+    target_func = None
+    if use_focused:
+        target_func = _pick_random_function(parent.block)
+        if target_func is None:
+            use_focused = False
+
+    if use_focused:
+        mutation_mode = "focused"
+        prompt = _build_focused_mutation_prompt(parent, generation, others, target_func)
+    else:
+        mutation_mode = "full"
+        prompt = _build_mutation_prompt(parent, generation, others)
 
     try:
         response = openai_client.responses.create(
@@ -278,6 +432,7 @@ def mutate(parent: Program, generation: int, population: list, openai_client) ->
         generation=generation,
         parent_scores=[parent.score],
         mutation_prompt=prompt,
+        mutation_mode=mutation_mode,
     )
 
 
@@ -330,6 +485,49 @@ class Population:
         return [p for island in self.islands for p in island]
 
 
+# ── Behavioral diversity archive ────────────────────────────────────────────────
+
+class FeatureArchive:
+    """Lightweight MAP-Elites-style behavioral diversity archive."""
+
+    def __init__(self, max_size: int = 20):
+        self.max_size = max_size
+        self._archive: dict[int, Program] = {}
+
+    def add(self, program: Program):
+        if not program.behavior or (program.score or 0) <= 0:
+            return
+        bh = hash(program.behavior)
+        existing = self._archive.get(bh)
+        if existing is None or (program.score or 0) > (existing.score or 0):
+            self._archive[bh] = program
+        if len(self._archive) > self.max_size:
+            worst_key = min(self._archive, key=lambda k: self._archive[k].score or 0)
+            del self._archive[worst_key]
+
+    def sample(self, k: int = 2) -> list:
+        programs = list(self._archive.values())
+        if not programs:
+            return []
+        return random.sample(programs, min(k, len(programs)))
+
+    def best(self) -> Optional[Program]:
+        if not self._archive:
+            return None
+        return max(self._archive.values(), key=lambda p: p.score or 0)
+
+    def size(self) -> int:
+        return len(self._archive)
+
+    def summary(self) -> str:
+        if not self._archive:
+            return "empty"
+        scores = sorted([(p.score or 0) for p in self._archive.values()], reverse=True)
+        top = ", ".join(f"{s:.4f}" for s in scores[:5])
+        suffix = "..." if len(scores) > 5 else ""
+        return f"{len(scores)} unique behaviors, top=[{top}{suffix}]"
+
+
 # ── Logging ──────────────────────────────────────────────────────────────────────
 
 def log_program(program: Program, generation: int):
@@ -353,9 +551,12 @@ def main():
     print(f"=== AlphaEvolve for Qwen3-VL-2B-Thinking ===")
     print(f"  Population: {POPULATION_SIZE} ({NUM_ISLANDS} islands x {POPULATION_SIZE//NUM_ISLANDS})")
     print(f"  Max generations: {MAX_GENERATIONS}")
+    print(f"  Pre-screen: {PRESCREEN_SAMPLES} samples, threshold={PRESCREEN_THRESHOLD}")
+    print(f"  Mutation: dual-mode (focused prob={DIFF_MUTATION_PROB})")
     print()
 
     population = Population(num_islands=NUM_ISLANDS, island_size=POPULATION_SIZE // NUM_ISLANDS)
+    archive = FeatureArchive(max_size=20)
 
     print("[Gen 0] Evaluating seed program (manual_thinking.py) ...")
     seed_code = SEED_FILE.read_text()
@@ -364,6 +565,7 @@ def main():
     seed = evaluate_program(seed)
     print(f"  Seed: accuracy={seed.accuracy:.4f}, avg_time={seed.avg_time:.3f}s, score={seed.score:.4f}")
     population.add(seed)
+    archive.add(seed)
     log_program(seed, 0)
 
     for i in range(1, NUM_ISLANDS):
@@ -371,6 +573,7 @@ def main():
             code=seed.code, block=seed.block,
             accuracy=seed.accuracy, avg_time=seed.avg_time,
             score=seed.score, generation=0, island=i,
+            behavior=seed.behavior,
         )
         population.add(clone)
 
@@ -386,19 +589,28 @@ def main():
             print("empty island, skipping.")
             continue
 
-        print(f"parent score={parent.score:.4f} — mutating ...", flush=True)
-        child = mutate(parent, gen, population.all_programs(), openai_client)
+        print(f"parent score={parent.score:.4f} — mutating "
+              f"(archive: {archive.size()} behaviors) ...", flush=True)
+        child = mutate(parent, gen, population.all_programs(), openai_client,
+                       archive_programs=archive.sample(2))
         if child is None:
             print(f"  [Gen {gen:03d}] Mutation failed.")
             continue
 
         child.island = island_idx
-        print(f"  [Gen {gen:03d}] Evaluating ...", flush=True)
-        child = evaluate_program(child)
+        print(f"  [Gen {gen:03d}] [{child.mutation_mode}] Evaluating ...", flush=True)
+        child = evaluate_program(child, parent_accuracy=parent.accuracy or 0.0)
+
+        if child.eval_error and ("prescreen fail" in child.eval_error
+                                 or "crash" in child.eval_error):
+            log_program(child, gen)
+            continue
+
         print(f"  [Gen {gen:03d}] accuracy={child.accuracy:.4f}, "
               f"avg_time={child.avg_time:.3f}s, score={child.score:.4f}")
 
         population.add(child)
+        archive.add(child)
         log_program(child, gen)
 
         if child.score > best_ever.score:
@@ -415,6 +627,7 @@ def main():
             print(f"\n--- Population at gen {gen} ---")
             for i, island in enumerate(population.islands):
                 print(f"  Island {i}: {[f'{p.score:.4f}' for p in island]}")
+            print(f"  Archive: {archive.summary()}")
             print(f"  Best: score={best_ever.score:.4f}\n")
 
     print(f"\n=== Evolution complete ===")

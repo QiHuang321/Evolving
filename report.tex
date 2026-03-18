@@ -143,34 +143,66 @@ answer.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 Both \texttt{evolve\_instruct.py} and \texttt{evolve\_thinking.py} implement
-the three core AlphaEvolve components.
+the core AlphaEvolve components, extended with three mechanisms inspired by the
+paper's full architecture.
 
-\paragraph{LLM-based mutation.}
-At each generation, the system sends the current parent program (full source of
-the \texttt{EVOLVE-BLOCK} region) along with its accuracy and speed to
-\texttt{gpt-5.2-codex}, together with up to two other population members as
-inspiration and a randomly chosen mutation strategy from a curated list of eight
-options (e.g.\ ``improve numeric extraction'', ``improve image preprocessing'',
-``improve Not Applicable detection''). The model returns a fenced Python block
-which the system validates syntactically before evaluation.
+\paragraph{LLM-based mutation (dual-mode).}
+At each generation, the system sends the current parent program along with its
+accuracy and speed to \texttt{gpt-5.2-codex}. We implement two mutation modes,
+selected with equal probability:
+\begin{itemize}
+  \item \textbf{Full-block rewrite:} the LLM receives the entire
+    \texttt{EVOLVE-BLOCK} and produces a complete replacement, together with a
+    randomly chosen mutation strategy from a curated list of eight options.
+  \item \textbf{Focused (diff-like) mutation:} we parse the parent block with
+    Python's \texttt{ast} module, randomly select one function name, and ask the
+    LLM to make a surgical, 1--15 line change to \emph{only} that function while
+    keeping everything else identical. This produces smaller, safer mutations
+    analogous to AlphaEvolve's diff-based prompting.
+\end{itemize}
+Both modes include up to two additional population members (including archive
+members) as ``inspiration'' in the prompt.
 
 \paragraph{Population management.}
 We maintain an island model with 2 islands of 4 programs each (8 total). Every
 5 generations the best individual from each island migrates to a random other
 island, providing diversity without sacrificing convergence within each island.
 
+\paragraph{Behavioral diversity archive.}
+In addition to the island population, we maintain a lightweight MAP-Elites-style
+\texttt{FeatureArchive} of up to 20 programs, indexed by the hash of their
+per-query correctness vector (a 128-bit behavior signature). Each unique
+behavior pattern retains only its highest-scoring representative. This ensures
+the system preserves programs that solve \emph{different subsets} of the
+benchmark, not just those with the highest aggregate score. Archive members are
+sampled as additional ``inspiration'' during mutation, encouraging the LLM to
+cross-pollinate solution strategies.
+
 \paragraph{Selection and elitism.}
 Tournament selection ($k=3$) within each island chooses the parent for
 mutation. A composite fitness score
 $f = 0.9 \times \text{accuracy} + 0.1 \times \text{speed\_bonus}$
 is used for ranking, keeping accuracy dominant. The globally best program is
-checkpointed to \texttt{evolved\_instruct.py} (or \texttt{evolved\_thinking.py})
-whenever a new maximum is found.
+checkpointed whenever a new maximum is found.
+
+\paragraph{Cascaded evaluation.}
+To avoid wasting compute on broken or obviously weak mutations, evaluation
+proceeds in three phases:
+\begin{enumerate}
+  \item \textbf{Crash check} (1 sample): if the candidate crashes or returns a
+    non-string, it is immediately discarded.
+  \item \textbf{Pre-screen} (16 samples): the candidate must achieve $\geq 70\%$
+    of the parent's accuracy on this subset to proceed. Failed candidates are
+    logged and discarded, saving $\sim$87.5\% of evaluation cost.
+  \item \textbf{Full evaluation} (all 128 samples): computes final accuracy,
+    speed, composite score, and behavior vector.
+\end{enumerate}
+Phases 1--3 share the same loaded module, so the VLM is only loaded once per
+candidate.
 
 \paragraph{Evolution loop.}
-Each run performs 40 generations, alternating between islands. Invalid Python
-mutations are discarded; programs with zero accuracy (indicating a runtime
-error) are also discarded. Full per-candidate results are appended under
+Each run performs 40 generations, alternating between islands. Full per-candidate
+results (including behavior vectors) are appended under
 \texttt{artifacts/evolution\_logs/} for post-hoc analysis.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
