@@ -15,7 +15,7 @@ All numbers are on the 128-sample CharXiv descriptive validation subset with gre
 | `evolved_thinking` | 0.5547 | 0.296 | Evolutionary search (Thinking) |
 | **`best_accuracy`** | **0.7969** | 0.307 | Evolved + bug fixes + title & colorbar verifiers |
 | **`best_overall`** | **0.7813** | 0.305 | Evolved + bug fixes + colorbar verifier |
-| `best_speed` | 0.5781 | **0.261** | Minimal prompt, no preprocessing |
+| `best_speed` | 0.5781 | batched | Per-image batched inference, no preprocessing |
 
 ### Accuracy Progression
 

@@ -1,7 +1,7 @@
 """Best-speed submission: minimal prompt, no image preprocessing, expanded NA detection.
 
 Supports both single-query and batched (per-image) inference.
-Accuracy: 0.5781 (74/128) | Avg time: ~0.10 s/query (batched)
+Accuracy: 0.5781 (74/128)
 """
 
 import re

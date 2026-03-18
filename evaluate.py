@@ -51,6 +51,11 @@ def evaluate(program):
             questions = [q for _, q in items]
             try:
                 responses = batch_fn(image_path=img_path, questions=questions)
+                if len(responses) != len(items):
+                    raise ValueError(
+                        f"vlm_inference_batch returned {len(responses)} answers "
+                        f"for {len(items)} questions on {img_path}"
+                    )
                 for (qk, _), resp in zip(items, responses):
                     queries[qk]["response"] = resp
             except Exception as e:

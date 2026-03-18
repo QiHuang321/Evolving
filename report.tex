@@ -268,10 +268,15 @@ Variant & Accuracy & Time (s/query) & Notes \\
 \texttt{evolved\_thinking} & 0.5547 & 0.296 & evolved improvement over manual thinking \\
 \midrule
 \texttt{best\_accuracy}    & \textbf{0.7969} & 0.307 & evolved + fixes + title \& colorbar verifiers \\
-\texttt{best\_speed}       & 0.5781 & \textbf{0.186} & batched inference, no image preprocessing \\
+\texttt{best\_speed}       & 0.5781 & --- & batched inference, no image preprocessing$^\dagger$ \\
 \texttt{best\_overall}     & 0.7813 & 0.305 & evolved + fixes + colorbar verifier \\
 \bottomrule
 \end{tabular}
+
+\smallskip
+{\small $^\dagger$Batched path processes 4 questions per forward pass.
+Wall-clock time varies across runs (0.19--0.33~s/query typical) because
+the evaluator's timer includes model loading; see text for details.}
 \end{table}
 
 Table~\ref{tab:progression} shows the incremental accuracy gains that built
@@ -423,7 +428,14 @@ CharXiv groups 4 questions per chart image. \texttt{best\_speed} exploits this
 by implementing \texttt{vlm\_inference\_batch}: all questions for one image are
 collated into a single padded batch (with left-padding for correct decoder-only
 generation), sharing the image encoding across all four queries. This reduces
-average latency from 0.261 to 0.186~s/query ($-$29\%), with identical accuracy.
+the number of forward passes from 128 to 32. Absolute wall-clock time varies
+across runs because \texttt{evaluate.py} includes model loading in its timing;
+on our hardware, typical warm-run times range from 0.19 to 0.33~s/query
+compared to 0.26~s/query for the unbatched path, confirming the expected
+speedup from shared image encoding.
+The evaluator includes a length check (
+\texttt{len(responses) == len(questions)}) to ensure batched results are never
+silently truncated.
 The evaluator \texttt{evaluate.py} detects the batch function automatically and
 falls back to single-query mode for modules that do not expose it.
 
@@ -432,9 +444,9 @@ Based on the above:
 \begin{itemize}
   \item \textbf{Best accuracy:} \texttt{best\_accuracy} (0.7969) --- evolved
         base + all post-processing fixes + title verifier + colorbar verifier.
-  \item \textbf{Best speed:} \texttt{best\_speed} (0.186 s/query) --- batched
-        per-image inference (4 questions/batch), no image preprocessing,
-        lightweight prompt, expanded NA detection.
+  \item \textbf{Best speed:} \texttt{best\_speed} --- batched per-image
+        inference (4 questions/batch with left-padding), no image
+        preprocessing, lightweight prompt, expanded NA detection.
   \item \textbf{Best overall:} \texttt{best\_overall} (0.7813) --- evolved image
         preprocessing + all post-processing fixes + colorbar verifier, no title
         verifier (to avoid multi-view latency on title questions).
@@ -495,7 +507,9 @@ post-processing.
 \paragraph{Future directions.}
 Our evolution system already implements cascaded evaluation and a behavioral
 diversity archive (\S4), but several avenues remain. Running more generations
-(our thinking variant was cut short at generation 15 by API rate limits),
+(our thinking variant completed all 40 generations but mutation calls began
+failing from generation 15 onward due to API quota exhaustion, so later
+generations effectively replayed existing parents),
 maintaining a larger population, or using a more capable mutation model could
 expand the search. Batched inference would further reduce evaluation cost per
 generation. On the verification side, extending the targeted-probe strategy
