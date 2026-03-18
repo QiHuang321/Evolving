@@ -1,5 +1,7 @@
-# EVOLVE-BLOCK-START
-"""Manual CharXiv inference optimized for Qwen/Qwen3-VL-2B-Instruct."""
+"""Best-overall submission: evolved code + post-processing bug fixes + colorbar verifier (no title TTA).
+
+Accuracy: 0.7813 (100/128) | Avg time: 0.305 s/query
+"""
 
 import re
 
@@ -41,18 +43,32 @@ _NA_PHRASES = [
     "not provided",
     "not shown",
     "not visible",
+    "not specified",
+    "not given",
     "cannot determine",
     "can't determine",
     "cannot be determined",
+    "unable to determine",
     "unclear",
+    "not clear",
     "unknown",
     "none",
     "no legend",
     "no colorbar",
     "no continuous legend",
     "no data",
+    "not present",
+    "does not exist",
     "not a line plot",
     "no lines",
+    "not sure",
+    "unsure",
+    "cannot tell",
+    "can't tell",
+    "hard to tell",
+    "insufficient information",
+    "insufficient data",
+    "no information",
 ]
 
 
@@ -163,8 +179,19 @@ def _dedupe(items):
 def _candidates(raw_text):
     text = raw_text.split("</think>")[-1].replace("<think>", " ")
     text = text.replace("**", " ").replace("`", " ")
-    lines = [line.strip(" -:") for line in text.splitlines() if line.strip()]
-    candidates = list(reversed(lines))
+    # Strip list markers but preserve leading negative signs
+    stripped = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # Remove leading bullet markers like "- " or ": " but keep "-1.00"
+        while s and s[0] in (' ', ':'):
+            s = s[1:]
+        if s.startswith('- ') and not (len(s) > 2 and s[1] == ' ' and s[2:3].isdigit()):
+            s = s[2:]
+        stripped.append(s)
+    candidates = list(reversed(stripped))
     if ":" in text:
         candidates.append(text.split(":")[-1].strip())
     candidates.append(text.strip())
@@ -176,6 +203,7 @@ def _looks_not_applicable(text):
     if lower in {"n/a", "na", "none", "null"}:
         return True
     return any(phrase in lower for phrase in _NA_PHRASES)
+
 
 
 def _normalize_text_answer(question, candidates):
@@ -218,6 +246,12 @@ def _normalize_text_answer(question, candidates):
                     value = value[len(prefix):]
                     break
         value = value.strip().strip('"').strip("'").rstrip(" .;:")
+        if "general trend of data from left to right" in q:
+            trend_map = {
+                "increasing": "increases",
+                "decreasing": "decreases",
+            }
+            value = trend_map.get(value.lower(), value)
         if value:
             return value
     return "Not Applicable"
@@ -249,13 +283,52 @@ def _normalize_answer(question, raw_text):
                 return "No"
         return "Not Applicable"
 
+    # For legend count questions, if model outputs a comma-separated label list
+    # instead of a count, deduplicate and return the count.
+    if "how many discrete labels are there in the legend" in q:
+        for candidate in candidates:
+            if _looks_not_applicable(candidate):
+                return "Not Applicable"
+            # If candidate contains commas, it's a label list; count unique labels.
+            if ',' in candidate:
+                parts = [p.strip() for p in candidate.split(',') if p.strip()]
+                if parts:
+                    return str(len(set(parts)))
+            matches = _NUMBER_RE.findall(candidate.replace(",", ""))
+            if matches:
+                return matches[-1].rstrip("%")
+        return "Not Applicable"
+
     if any(phrase in q for phrase in _NUMERIC_PHRASES):
+        # For tick value questions (leftmost/rightmost/lowest/highest), ticks can
+        # be text strings (e.g. "SSM", "Heter-unaware"), not only numbers.
+        is_positional_tick = any(p in q for p in [
+            "leftmost labeled tick", "rightmost labeled tick",
+            "spatially lowest labeled tick", "spatially highest labeled tick",
+        ])
+        # For positional ticks, if the raw answer looks like a text string
+        # (contains letters and is not just a number), treat as text answer.
+        if is_positional_tick and candidates:
+            first = candidates[0] if len(candidates) == 1 else candidates[-1]  # last = original raw
+            raw_clean = first.strip()
+            # Preserve caret scientific notation like 10^-6, 10^1
+            if raw_clean and '^' in raw_clean and re.fullmatch(r'[-+]?[0-9]+\^[-+]?[0-9]+', raw_clean):
+                return raw_clean
+            # If it has letters and isn't pure NA, it's likely a text tick label
+            if raw_clean and any(c.isalpha() for c in raw_clean) and not _looks_not_applicable(raw_clean):
+                has_pure_number = bool(re.fullmatch(r'[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?%?', raw_clean))
+                if not has_pure_number:
+                    return _normalize_text_answer(question, candidates)
         for candidate in candidates:
             if _looks_not_applicable(candidate):
                 return "Not Applicable"
             matches = _NUMBER_RE.findall(candidate.replace(",", ""))
             if matches:
                 return matches[-1].rstrip("%")
+        # If no number found but this is a positional tick question,
+        # fall through to text normalization (tick might be a word).
+        if is_positional_tick:
+            return _normalize_text_answer(question, candidates)
         return "Not Applicable"
 
     return _normalize_text_answer(question, candidates)
@@ -282,10 +355,16 @@ def vlm_inference(image_path, question="Describe this image in detail."):
     if pad_token_id is None:
         pad_token_id = processor.tokenizer.eos_token_id
 
+    # Dynamic token budget
+    q_lower = " ".join(question.lower().split())
+    max_tokens = _MAX_NEW_TOKENS
+    if "legend" in q_lower or "title" in q_lower or "label of the" in q_lower:
+        max_tokens = max(_MAX_NEW_TOKENS, 64)
+
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=_MAX_NEW_TOKENS,
+            max_new_tokens=max_tokens,
             do_sample=False,
             use_cache=True,
             pad_token_id=pad_token_id,
@@ -293,5 +372,25 @@ def vlm_inference(image_path, question="Describe this image in detail."):
 
     trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     raw_text = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-    return _normalize_answer(question, raw_text)
-# EVOLVE-BLOCK-END
+    base_answer = _normalize_answer(question, raw_text)
+
+    # Continuous legend verifier
+    if "continuous legend" in q_lower and base_answer != "Not Applicable":
+        probe_prompt = chr(10).join([
+            "Look at this chart carefully.",
+            "Does this chart contain a continuous legend (also called a colorbar)?",
+            "A colorbar is a gradient bar mapping colors to numeric values.",
+            "A discrete legend listing category names is NOT a colorbar.",
+            "Answer exactly: Yes or No.",
+        ])
+        probe_msgs = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": probe_prompt}]}]
+        probe_text = processor.apply_chat_template(probe_msgs, tokenize=False, add_generation_prompt=True)
+        probe_inputs = processor(text=[probe_text], images=image_inputs, padding=True, return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            probe_ids = model.generate(**probe_inputs, max_new_tokens=8, do_sample=False, use_cache=True, pad_token_id=pad_token_id)
+        probe_trimmed = [o[len(i):] for i, o in zip(probe_inputs.input_ids, probe_ids)]
+        probe_answer = processor.batch_decode(probe_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip().lower()
+        if "no" in probe_answer:
+            return "Not Applicable"
+
+    return base_answer

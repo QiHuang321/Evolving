@@ -1,6 +1,7 @@
-# EVOLVE-BLOCK-START
+"""Best-speed submission: minimal prompt, no image preprocessing, expanded NA detection.
 
-"""Manual CharXiv inference optimized for Qwen/Qwen3-VL-2B-Instruct."""
+Accuracy: 0.5781 (74/128) | Avg time: 0.261 s/query
+"""
 
 import re
 
@@ -33,6 +34,40 @@ _NUMERIC_PHRASES = [
     "difference between the maximum and minimum values of the tick labels on the continuous legend",
     "total number of explicitly labeled ticks across all axes",
     "number of subplots",
+]
+
+_NA_PHRASES = [
+    "not applicable",
+    "not available",
+    "not provided",
+    "not shown",
+    "not visible",
+    "not specified",
+    "not given",
+    "cannot determine",
+    "can't determine",
+    "cannot be determined",
+    "unable to determine",
+    "unclear",
+    "not clear",
+    "unknown",
+    "none",
+    "no legend",
+    "no colorbar",
+    "no continuous legend",
+    "no data",
+    "not present",
+    "does not exist",
+    "not a line plot",
+    "no lines",
+    "not sure",
+    "unsure",
+    "cannot tell",
+    "can't tell",
+    "hard to tell",
+    "insufficient information",
+    "insufficient data",
+    "no information",
 ]
 
 
@@ -98,19 +133,35 @@ def _dedupe(items):
 def _candidates(raw_text):
     text = raw_text.split("</think>")[-1].replace("<think>", " ")
     text = text.replace("**", " ").replace("`", " ")
-    lines = [line.strip(" -:") for line in text.splitlines() if line.strip()]
-    candidates = list(reversed(lines))
+    # Strip list markers but preserve leading negative signs
+    stripped = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        while s and s[0] in (' ', ':'):
+            s = s[1:]
+        if s.startswith('- ') and not (len(s) > 2 and s[1] == ' ' and s[2:3].isdigit()):
+            s = s[2:]
+        stripped.append(s)
+    candidates = list(reversed(stripped))
     if ":" in text:
         candidates.append(text.split(":")[-1].strip())
     candidates.append(text.strip())
     return _dedupe([" ".join(candidate.split()) for candidate in candidates if candidate.strip()])
 
 
+def _looks_not_applicable(text):
+    lower = text.lower().strip()
+    if lower in {"n/a", "na", "none", "null"}:
+        return True
+    return any(phrase in lower for phrase in _NA_PHRASES)
+
+
 def _normalize_text_answer(question, candidates):
     q = " ".join(question.lower().split())
     for candidate in candidates:
-        lower = candidate.lower()
-        if "not applicable" in lower:
+        if _looks_not_applicable(candidate):
             return "Not Applicable"
         value = candidate.strip().strip('"').strip("'")
         if "names of the labels in the legend" in q:
@@ -147,6 +198,12 @@ def _normalize_text_answer(question, candidates):
                     value = value[len(prefix):]
                     break
         value = value.strip().strip('"').strip("'").rstrip(" .;:")
+        if "general trend of data from left to right" in q:
+            trend_map = {
+                "increasing": "increases",
+                "decreasing": "decreases",
+            }
+            value = trend_map.get(value.lower(), value)
         if value:
             return value
     return "Not Applicable"
@@ -167,26 +224,52 @@ def _normalize_answer(question, raw_text):
 
     if "do any lines intersect" in q:
         for candidate in candidates:
-            lower = candidate.lower()
-            if "not applicable" in lower or "no lines" in lower or "not a line plot" in lower:
+            if _looks_not_applicable(candidate):
                 return "Not Applicable"
-            words = [word for word in re.split(r"[^a-z]+", lower) if word]
+            words = [word for word in re.split(r"[^a-z]+", candidate.lower()) if word]
             if "yes" in words:
                 return "Yes"
             if "no" in words:
                 return "No"
         return "Not Applicable"
 
-    if any(phrase in q for phrase in _NUMERIC_PHRASES):
+    # For legend count questions, if model outputs a comma-separated label list
+    # instead of a count, deduplicate and return the count.
+    if "how many discrete labels are there in the legend" in q:
         for candidate in candidates:
-            lower = candidate.lower()
-            if "not applicable" in lower:
+            if _looks_not_applicable(candidate):
                 return "Not Applicable"
-            if "legend" in q and ("no legend" in lower or "no colorbar" in lower or "no continuous legend" in lower):
+            if ',' in candidate:
+                parts = [p.strip() for p in candidate.split(',') if p.strip()]
+                if parts:
+                    return str(len(set(parts)))
+            matches = _NUMBER_RE.findall(candidate.replace(",", ""))
+            if matches:
+                return matches[-1].rstrip("%")
+        return "Not Applicable"
+
+    if any(phrase in q for phrase in _NUMERIC_PHRASES):
+        is_positional_tick = any(p in q for p in [
+            "leftmost labeled tick", "rightmost labeled tick",
+            "spatially lowest labeled tick", "spatially highest labeled tick",
+        ])
+        if is_positional_tick and candidates:
+            first = candidates[0] if len(candidates) == 1 else candidates[-1]
+            raw_clean = first.strip()
+            if raw_clean and '^' in raw_clean and re.fullmatch(r'[-+]?[0-9]+\^[-+]?[0-9]+', raw_clean):
+                return raw_clean
+            if raw_clean and any(c.isalpha() for c in raw_clean) and not _looks_not_applicable(raw_clean):
+                has_pure_number = bool(re.fullmatch(r'[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?%?', raw_clean))
+                if not has_pure_number:
+                    return _normalize_text_answer(question, candidates)
+        for candidate in candidates:
+            if _looks_not_applicable(candidate):
                 return "Not Applicable"
             matches = _NUMBER_RE.findall(candidate.replace(",", ""))
             if matches:
                 return matches[-1].rstrip("%")
+        if is_positional_tick:
+            return _normalize_text_answer(question, candidates)
         return "Not Applicable"
 
     return _normalize_text_answer(question, candidates)
@@ -223,5 +306,3 @@ def vlm_inference(image_path, question="Describe this image in detail."):
     trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     raw_text = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
     return _normalize_answer(question, raw_text)
-
-# EVOLVE-BLOCK-END

@@ -11,10 +11,10 @@ run_eval() {
   echo
 }
 
-run_eval manual_instruct
-run_eval manual_thinking
-run_eval evolved_instruct
-run_eval evolved_thinking
-run_eval best_accuracy
-run_eval best_speed
-run_eval best_overall
+run_eval manual_instruct     # expected: 0.5391
+run_eval manual_thinking     # expected: 0.5078
+run_eval evolved_instruct    # expected: 0.6094
+run_eval evolved_thinking    # expected: 0.5547
+run_eval best_accuracy       # expected: 0.7969
+run_eval best_speed          # expected: 0.5781
+run_eval best_overall        # expected: 0.7813
