@@ -1,5 +1,5 @@
 # EVOLVE-BLOCK-START
-"""Manual CharXiv inference optimized for Qwen/Qwen3-VL-2B-Instruct."""
+"""Best-overall CharXiv inference: evolved_instruct + post-processing bug fixes."""
 
 import re
 
@@ -163,8 +163,19 @@ def _dedupe(items):
 def _candidates(raw_text):
     text = raw_text.split("</think>")[-1].replace("<think>", " ")
     text = text.replace("**", " ").replace("`", " ")
-    lines = [line.strip(" -:") for line in text.splitlines() if line.strip()]
-    candidates = list(reversed(lines))
+    # Strip list markers but preserve leading negative signs
+    stripped = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # Remove leading bullet markers like "- " or ": " but keep "-1.00"
+        while s and s[0] in (' ', ':'):
+            s = s[1:]
+        if s.startswith('- ') and not (len(s) > 2 and s[1] == ' ' and s[2:3].isdigit()):
+            s = s[2:]
+        stripped.append(s)
+    candidates = list(reversed(stripped))
     if ":" in text:
         candidates.append(text.split(":")[-1].strip())
     candidates.append(text.strip())
@@ -176,6 +187,7 @@ def _looks_not_applicable(text):
     if lower in {"n/a", "na", "none", "null"}:
         return True
     return any(phrase in lower for phrase in _NA_PHRASES)
+
 
 
 def _normalize_text_answer(question, candidates):
@@ -218,6 +230,12 @@ def _normalize_text_answer(question, candidates):
                     value = value[len(prefix):]
                     break
         value = value.strip().strip('"').strip("'").rstrip(" .;:")
+        if "general trend of data from left to right" in q:
+            trend_map = {
+                "increasing": "increases",
+                "decreasing": "decreases",
+            }
+            value = trend_map.get(value.lower(), value)
         if value:
             return value
     return "Not Applicable"
@@ -249,13 +267,52 @@ def _normalize_answer(question, raw_text):
                 return "No"
         return "Not Applicable"
 
+    # For legend count questions, if model outputs a comma-separated label list
+    # instead of a count, deduplicate and return the count.
+    if "how many discrete labels are there in the legend" in q:
+        for candidate in candidates:
+            if _looks_not_applicable(candidate):
+                return "Not Applicable"
+            # If candidate contains commas, it's a label list; count unique labels.
+            if ',' in candidate:
+                parts = [p.strip() for p in candidate.split(',') if p.strip()]
+                if parts:
+                    return str(len(set(parts)))
+            matches = _NUMBER_RE.findall(candidate.replace(",", ""))
+            if matches:
+                return matches[-1].rstrip("%")
+        return "Not Applicable"
+
     if any(phrase in q for phrase in _NUMERIC_PHRASES):
+        # For tick value questions (leftmost/rightmost/lowest/highest), ticks can
+        # be text strings (e.g. "SSM", "Heter-unaware"), not only numbers.
+        is_positional_tick = any(p in q for p in [
+            "leftmost labeled tick", "rightmost labeled tick",
+            "spatially lowest labeled tick", "spatially highest labeled tick",
+        ])
+        # For positional ticks, if the raw answer looks like a text string
+        # (contains letters and is not just a number), treat as text answer.
+        if is_positional_tick and candidates:
+            first = candidates[0] if len(candidates) == 1 else candidates[-1]  # last = original raw
+            raw_clean = first.strip()
+            # Preserve caret scientific notation like 10^-6, 10^1
+            if raw_clean and '^' in raw_clean and re.fullmatch(r'[-+]?[0-9]+\^[-+]?[0-9]+', raw_clean):
+                return raw_clean
+            # If it has letters and isn't pure NA, it's likely a text tick label
+            if raw_clean and any(c.isalpha() for c in raw_clean) and not _looks_not_applicable(raw_clean):
+                has_pure_number = bool(re.fullmatch(r'[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?%?', raw_clean))
+                if not has_pure_number:
+                    return _normalize_text_answer(question, candidates)
         for candidate in candidates:
             if _looks_not_applicable(candidate):
                 return "Not Applicable"
             matches = _NUMBER_RE.findall(candidate.replace(",", ""))
             if matches:
                 return matches[-1].rstrip("%")
+        # If no number found but this is a positional tick question,
+        # fall through to text normalization (tick might be a word).
+        if is_positional_tick:
+            return _normalize_text_answer(question, candidates)
         return "Not Applicable"
 
     return _normalize_text_answer(question, candidates)

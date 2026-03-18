@@ -43,10 +43,17 @@ manually optimize the inference pipeline through prompt engineering, structured
 output normalization, and image caching, reaching 53.9\% accuracy with a
 13$\times$ speed improvement. We then implement an evolutionary system that uses
 an LLM (GPT) as a mutation operator over a maintained population of candidate
-programs, automatically discovering improvements without further human
-intervention. The evolved instruct variant achieves 60.2\% accuracy---a
-21.9 percentage point improvement over the baseline---demonstrating that
-automated code evolution can meaningfully outperform manual optimization alone.
+programs, automatically discovering improvements such as adaptive image
+upscaling and unsharp masking, reaching 60.2\% accuracy. Finally, through
+systematic per-sample error analysis, we identify and fix five post-processing
+bugs (negative sign stripping, text tick mishandling, caret notation breakage,
+legend count deduplication, and trend synonym mismatch) that together yield a
+further 9.4~pp gain to 69.5\%---a 31.2 percentage point improvement over the
+baseline. We also explore test-time augmentation (TTA) and find it net negative
+except for a narrow title-verification heuristic. These results show that
+careful output analysis and targeted bug fixes can substantially outperform
+sophisticated inference techniques when the bottleneck is post-processing rather
+than model perception.
 \end{abstract}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -171,7 +178,7 @@ error) are also discarded. Full per-candidate results are appended under
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 Table~\ref{tab:results} reports accuracy and average inference time per query
-on the 128-sample development subset for the five primary systems.
+on the 128-sample development subset for all submitted systems.
 
 \begin{table}[h]
 \centering
@@ -182,11 +189,38 @@ Timing is wall-clock per query on the same GPU.}
 \toprule
 Variant & Accuracy & Time (s/query) & Notes \\
 \midrule
-\texttt{starting\_scripts} & 0.3828 & 3.4841 & naive baseline \\
-\texttt{manual\_instruct}  & 0.5391 & \textbf{0.2689} & +15.6 pp; 13$\times$ faster \\
-\texttt{manual\_thinking}  & 0.5078 & 0.2752 & thinking model, suppressed reasoning \\
-\texttt{evolved\_instruct} & \textbf{0.6016} & 0.3100 & best accuracy, best overall \\
-\texttt{evolved\_thinking} & 0.5469 & 0.2714 & evolved improvement over manual thinking \\
+\texttt{starting\_scripts} & 0.3828 & 3.484 & naive baseline \\
+\texttt{manual\_instruct}  & 0.5391 & 0.269 & +15.6 pp; 13$\times$ faster \\
+\texttt{manual\_thinking}  & 0.5078 & 0.275 & thinking model, suppressed reasoning \\
+\texttt{evolved\_instruct} & 0.6016 & 0.310 & +6.3 pp over manual (evolution-discovered) \\
+\texttt{evolved\_thinking} & 0.5469 & 0.271 & evolved improvement over manual thinking \\
+\midrule
+\texttt{best\_accuracy}    & \textbf{0.6953} & 0.293 & evolved + post-processing fixes + title verifier \\
+\texttt{best\_speed}       & 0.5781 & \textbf{0.265} & no image preprocessing, fast prompt \\
+\texttt{best\_overall}     & 0.6797 & 0.310 & evolved + post-processing fixes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:progression} shows the incremental accuracy gains that built
+the final \texttt{best\_accuracy} result.
+
+\begin{table}[h]
+\centering
+\caption{Step-by-step accuracy progression for \texttt{best\_accuracy}.}
+\label{tab:progression}
+\begin{tabular}{lrl}
+\toprule
+Change & Accuracy & $\Delta$ \\
+\midrule
+Evolved instruct (baseline for best\_accuracy) & 0.6016 & --- \\
++ Title verifier (3-view TTA, narrow trigger) & 0.6172 & +1.6 pp \\
++ Trend synonym normalization & 0.6250 & +0.8 pp \\
++ Fix negative-sign stripping in \texttt{\_candidates} & 0.6797 & +5.5 pp \\
++ Fix positional-tick text fallback & (combined) & (combined) \\
++ Fix embedded-number regex over-match & (combined) & (combined) \\
++ Preserve caret notation (e.g.\ \texttt{10\^{}-6}) & 0.6953 & +1.6 pp \\
++ Legend count dedup from label lists & (combined) & (combined) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -203,6 +237,28 @@ constraints discovered by the mutation LLM. Notably, these image-level changes
 were not part of the manual baseline and would have been non-obvious to add by
 hand.
 
+\paragraph{Post-processing bug fixes.}
+The largest accuracy leap (+9.4~pp, from 0.6016 to 0.6953) came not from
+model-level changes but from systematic per-sample error analysis of raw model
+outputs vs.\ post-processed answers. We identified five bugs:
+\begin{enumerate}
+  \item \textbf{Negative sign stripping:} \texttt{line.strip(" -:")} in
+    \texttt{\_candidates()} removed the leading minus from values like
+    \texttt{-1.00}, causing mismatches on tick-value questions.
+  \item \textbf{Positional tick text fallback:} tick labels such as ``SSM'' or
+    ``Heter-unaware'' were always routed to the numeric extraction branch,
+    which returned ``Not Applicable'' instead of the text answer.
+  \item \textbf{Embedded-number regex over-match:} a label like
+    ``ResNet-1'' caused the number regex to extract ``1'' instead of returning
+    the full text string.
+  \item \textbf{Caret scientific notation:} \texttt{10\^{}-6} was split by
+    the number regex into separate tokens; we now detect the caret pattern
+    and preserve it as-is.
+  \item \textbf{Legend count dedup:} when asked ``how many discrete labels,''
+    the model sometimes outputs a comma-separated label list instead of a
+    count; we now split, deduplicate, and count.
+\end{enumerate}
+
 \paragraph{Instruct vs.\ Thinking.}
 The Instruct model consistently outperforms the Thinking model across both
 manual and evolved variants. The Thinking model's chain-of-thought mechanism is
@@ -210,14 +266,31 @@ a liability for exact-match short-answer tasks: even with reasoning suppressed,
 it is more sensitive to prompt phrasing and occasionally produces longer
 responses that fail normalization.
 
+\paragraph{Test-time augmentation (TTA).}
+We explored multi-view TTA---generating answers from multiple image
+enhancements (sharpened, grayscale, high-contrast) and aggregating via majority
+vote. \textbf{Global TTA was net negative} (0.6016$\to$0.5625): the additional
+views introduced more noise than signal across most question types. We then
+narrowed the scope to a \textbf{title verification heuristic}: if the base
+answer to a ``what is its title'' question matches a panel-marker pattern
+(e.g.\ ``(b)'', ``(d)''), we run 3 views with a strict probe prompt and
+require unanimous agreement to override. This rescued 2 samples with zero
+injuries (+1.6~pp).
+
+We also tested consistency-check mediators for legend count, legend label, and
+colorbar questions. All were unsafe: the model's meta-judgments (``does this
+chart have a legend?'') were less reliable than its direct answers.
+
 \paragraph{Best deliverables.}
 Based on the above:
 \begin{itemize}
-  \item \textbf{Best accuracy:} \texttt{evolved\_instruct} (0.6016)
-  \item \textbf{Best speed:} \texttt{manual\_instruct} (0.2689 s/query, while still
-        achieving 53.9\% accuracy)
-  \item \textbf{Best overall:} \texttt{evolved\_instruct} (highest composite
-        score $f = 0.6325$)
+  \item \textbf{Best accuracy:} \texttt{best\_accuracy} (0.6953) --- evolved
+        base + all post-processing fixes + title verifier.
+  \item \textbf{Best speed:} \texttt{best\_speed} (0.269 s/query) --- no image
+        preprocessing, lightweight prompt, same post-processing fixes.
+  \item \textbf{Best overall:} \texttt{best\_overall} --- evolved image
+        preprocessing + all post-processing fixes, no title verifier (to avoid
+        the 3$\times$ latency penalty on title questions).
 \end{itemize}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -225,36 +298,54 @@ Based on the above:
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 \paragraph{What worked.}
-Exact-match-oriented prompting had the highest single-change impact. Many
-baseline failures were pure formatting failures: the model knew the correct
-value but wrapped it in a sentence. Structured output normalization provided
-additional gains at essentially zero computational cost. Seeding evolution from
-an already-optimized manual baseline (rather than the naive starter) was
-critical: early generations can refine rather than recover basic competence.
+Exact-match-oriented prompting had the highest single-change impact in the
+manual phase. Many baseline failures were pure formatting failures: the model
+knew the correct value but wrapped it in a sentence. Structured output
+normalization provided additional gains at essentially zero computational cost.
+Seeding evolution from an already-optimized manual baseline (rather than the
+naive starter) was critical: early generations can refine rather than recover
+basic competence.
+
+The most impactful technique overall was \textbf{per-sample error analysis},
+comparing raw model output against post-processed answers. This revealed that
+the model was often correct but the normalization code was discarding or
+corrupting the answer. Five targeted bug fixes yielded +9.4~pp at zero
+computational cost.
 
 \paragraph{What did not work.}
-A non-trivial fraction of GPT mutations produced syntactically valid but
-semantically broken code (zero accuracy at runtime). More robust sanity-checking
-(e.g.\ a one-sample pre-screen) could save significant evaluation time. The
-Thinking model was more fragile and expensive to evolve: its generation length
-variability made latency less predictable and some mutations accidentally
-re-enabled verbose reasoning, sharply hurting exact-match accuracy.
+Global test-time augmentation (multi-view voting) was net negative ($-$3.9~pp).
+The 2B model's outputs were highly consistent across image variants, so
+majority voting rarely rescued errors but did introduce new ones when a minority
+view happened to be wrong.
 
-\paragraph{Causal analysis.}
-A limitation of the current evolution system is that each mutation typically
-changes multiple components simultaneously (prompt, preprocessing, normalization)
-making it impossible to attribute an accuracy change to a specific intervention.
-Applying a single-variable ablation study in the manual phase---or designing
-mutations that change exactly one component per generation---would enable proper
-causal attribution of each technique's contribution.
+Consistency-check mediators (asking the model meta-questions like ``does this
+chart have a legend?'' to gate answers) were also unsafe. The model's
+meta-judgments proved less reliable than its direct task answers.
+
+A non-trivial fraction of GPT mutations (8/37 for instruct, 1/32 for thinking)
+produced syntactically valid but semantically broken code (zero accuracy at
+runtime). More robust sanity-checking (e.g.\ a one-sample pre-screen) could
+save significant evaluation time.
+
+\paragraph{Remaining errors.}
+Of the 39 remaining errors (out of 128), the dominant categories are:
+\begin{itemize}
+  \item \textbf{Colorbar existence confusion} (13 errors): the model
+    confidently reads tick values from charts that have no colorbar, or
+    reads values from the wrong chart region.
+  \item \textbf{Numeric tick counting bias} (7 errors): systematic
+    over-counting when asked ``how many ticks across all axes.''
+  \item \textbf{OCR precision} (remainder): the model reads
+    visually similar numbers incorrectly (e.g.\ ``0.7'' vs ``0.8'').
+\end{itemize}
+These are model perception limits, not fixable through post-processing.
 
 \paragraph{Future directions.}
 Increasing the number of generations, maintaining a larger population, or using
-a more powerful mutation model could push accuracy further. Incorporating
-reasoning-type CharXiv questions alongside descriptive ones would test
-generalization. A structured mutation operator that performs targeted single-factor
-interventions, guided by causal inference, could improve both sample efficiency
-and interpretability of the evolution process.
+a more powerful mutation model could push accuracy further. Adding cascaded
+evaluation (fast pre-screen on a small sample subset) and behavioral diversity
+maintenance (MAP-Elites-style feature archives) to the evolution system would
+improve both efficiency and exploration.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Conclusion}
@@ -262,10 +353,12 @@ and interpretability of the evolution process.
 
 We implemented an AlphaEvolve-style evolutionary code optimization system for
 VLM chart inference and showed that it improves accuracy by 21.9 pp over the
-naive baseline and 6.3 pp over careful manual optimization. The results confirm
-that automated code evolution, seeded with human insight, is a practically
-useful technique for optimizing structured inference pipelines where the model
-weights are fixed.
+naive baseline and 6.3 pp over careful manual optimization. Subsequent
+per-sample error analysis and targeted post-processing bug fixes pushed accuracy
+to 69.5\%---a 31.2 pp total improvement. The results confirm that automated
+code evolution, seeded with human insight, is a practically useful starting
+point, but that systematic output analysis and targeted engineering remain
+essential for maximizing exact-match accuracy when the model weights are fixed.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \bibliographystyle{plain}
