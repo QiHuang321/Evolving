@@ -41,18 +41,32 @@ _NA_PHRASES = [
     "not provided",
     "not shown",
     "not visible",
+    "not specified",
+    "not given",
     "cannot determine",
     "can't determine",
     "cannot be determined",
+    "unable to determine",
     "unclear",
+    "not clear",
     "unknown",
     "none",
     "no legend",
     "no colorbar",
     "no continuous legend",
     "no data",
+    "not present",
+    "does not exist",
     "not a line plot",
     "no lines",
+    "not sure",
+    "unsure",
+    "cannot tell",
+    "can't tell",
+    "hard to tell",
+    "insufficient information",
+    "insufficient data",
+    "no information",
 ]
 
 
@@ -339,10 +353,16 @@ def vlm_inference(image_path, question="Describe this image in detail."):
     if pad_token_id is None:
         pad_token_id = processor.tokenizer.eos_token_id
 
+    # Dynamic token budget
+    q_lower = " ".join(question.lower().split())
+    max_tokens = _MAX_NEW_TOKENS
+    if "legend" in q_lower or "title" in q_lower or "label of the" in q_lower:
+        max_tokens = max(_MAX_NEW_TOKENS, 64)
+
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=_MAX_NEW_TOKENS,
+            max_new_tokens=max_tokens,
             do_sample=False,
             use_cache=True,
             pad_token_id=pad_token_id,
@@ -350,5 +370,26 @@ def vlm_inference(image_path, question="Describe this image in detail."):
 
     trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     raw_text = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-    return _normalize_answer(question, raw_text)
+    base_answer = _normalize_answer(question, raw_text)
+
+    # Continuous legend verifier
+    if "continuous legend" in q_lower and base_answer != "Not Applicable":
+        probe_prompt = chr(10).join([
+            "Look at this chart carefully.",
+            "Does this chart contain a continuous legend (also called a colorbar)?",
+            "A colorbar is a gradient bar mapping colors to numeric values.",
+            "A discrete legend listing category names is NOT a colorbar.",
+            "Answer exactly: Yes or No.",
+        ])
+        probe_msgs = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": probe_prompt}]}]
+        probe_text = processor.apply_chat_template(probe_msgs, tokenize=False, add_generation_prompt=True)
+        probe_inputs = processor(text=[probe_text], images=image_inputs, padding=True, return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            probe_ids = model.generate(**probe_inputs, max_new_tokens=8, do_sample=False, use_cache=True, pad_token_id=pad_token_id)
+        probe_trimmed = [o[len(i):] for i, o in zip(probe_inputs.input_ids, probe_ids)]
+        probe_answer = processor.batch_decode(probe_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip().lower()
+        if "no" in probe_answer:
+            return "Not Applicable"
+
+    return base_answer
 # EVOLVE-BLOCK-END

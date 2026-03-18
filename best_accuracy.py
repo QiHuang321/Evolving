@@ -43,18 +43,32 @@ _NA_PHRASES = [
     "not provided",
     "not shown",
     "not visible",
+    "not specified",
+    "not given",
     "cannot determine",
     "can't determine",
     "cannot be determined",
+    "unable to determine",
     "unclear",
+    "not clear",
     "unknown",
     "none",
     "no legend",
     "no colorbar",
     "no continuous legend",
     "no data",
+    "not present",
+    "does not exist",
     "not a line plot",
     "no lines",
+    "not sure",
+    "unsure",
+    "cannot tell",
+    "can't tell",
+    "hard to tell",
+    "insufficient information",
+    "insufficient data",
+    "no information",
 ]
 
 
@@ -226,17 +240,33 @@ def _candidates(raw_text):
     return _dedupe([" ".join(candidate.split()) for candidate in candidates if candidate.strip()])
 
 
-def _looks_not_applicable(text):
+def _looks_not_applicable(text, question=""):
     lower = text.lower().strip()
+    if not lower:
+        return True
     if lower in {"n/a", "na", "none", "null"}:
         return True
-    return any(phrase in lower for phrase in _NA_PHRASES)
+    if any(phrase in lower for phrase in _NA_PHRASES):
+        return True
+    # Context-specific NA: legend questions where model says "no" or "none"
+    q = " ".join(question.lower().split()) if question else ""
+    if q and "legend" in q and lower in {"no", "none"}:
+        return True
+    if q and ("label" in q or "title" in q) and lower in {"no", "none"}:
+        return True
+    # Line intersection: model says there are no lines
+    if q and "intersect" in q and "line" in q:
+        if re.search(r"\bno\s+lines?\s+(are\s+)?(shown|present|plotted|visible|available|drawn|displayed)\b", lower):
+            return True
+        if "not a line plot" in lower or "not a line graph" in lower or "no line plot" in lower:
+            return True
+    return False
 
 
 def _normalize_text_answer(question, candidates):
     q = " ".join(question.lower().split())
     for candidate in candidates:
-        if _looks_not_applicable(candidate):
+        if _looks_not_applicable(candidate, question):
             return "Not Applicable"
         value = candidate.strip().strip('"').strip("'")
         if "names of the labels in the legend" in q:
@@ -295,13 +325,13 @@ def _normalize_answer(question, raw_text):
             match = _LAYOUT_RE.search(candidate)
             if match:
                 return f"{match.group(1)} by {match.group(2)}"
-            if _looks_not_applicable(candidate):
+            if _looks_not_applicable(candidate, question):
                 return "Not Applicable"
         return "1 by 1"
 
     if "do any lines intersect" in q:
         for candidate in candidates:
-            if _looks_not_applicable(candidate):
+            if _looks_not_applicable(candidate, question):
                 return "Not Applicable"
             words = [word for word in re.split(r"[^a-z]+", candidate.lower()) if word]
             if "yes" in words:
@@ -314,7 +344,7 @@ def _normalize_answer(question, raw_text):
     # instead of a count, deduplicate and return the count.
     if "how many discrete labels are there in the legend" in q:
         for candidate in candidates:
-            if _looks_not_applicable(candidate):
+            if _looks_not_applicable(candidate, question):
                 return "Not Applicable"
             # If candidate contains commas, it's a label list; count unique labels.
             if ',' in candidate:
@@ -342,12 +372,12 @@ def _normalize_answer(question, raw_text):
             if raw_clean and '^' in raw_clean and re.fullmatch(r'[-+]?[0-9]+\^[-+]?[0-9]+', raw_clean):
                 return raw_clean
             # If it has letters and isn't pure NA, it's likely a text tick label
-            if raw_clean and any(c.isalpha() for c in raw_clean) and not _looks_not_applicable(raw_clean):
+            if raw_clean and any(c.isalpha() for c in raw_clean) and not _looks_not_applicable(raw_clean, question):
                 has_pure_number = bool(re.fullmatch(r'[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?%?', raw_clean))
                 if not has_pure_number:
                     return _normalize_text_answer(question, candidates)
         for candidate in candidates:
-            if _looks_not_applicable(candidate):
+            if _looks_not_applicable(candidate, question):
                 return "Not Applicable"
             matches = _NUMBER_RE.findall(candidate.replace(",", ""))
             if matches:
@@ -378,10 +408,16 @@ def _run_single(model, processor, image_path, question, prompt, variant="default
     if pad_token_id is None:
         pad_token_id = processor.tokenizer.eos_token_id
 
+    # Dynamic token budget: text answers (legend labels, titles) may need more tokens
+    q_lower = " ".join(question.lower().split())
+    max_tokens = _MAX_NEW_TOKENS
+    if "legend" in q_lower or "title" in q_lower or "label of the" in q_lower:
+        max_tokens = max(_MAX_NEW_TOKENS, 64)
+
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=_MAX_NEW_TOKENS,
+            max_new_tokens=max_tokens,
             do_sample=False,
             use_cache=True,
             pad_token_id=pad_token_id,
@@ -396,6 +432,11 @@ def _is_title_question(question):
     return "what is its title" in " ".join(question.lower().split())
 
 
+def _is_continuous_legend_question(question):
+    q = " ".join(question.lower().split())
+    return "continuous legend" in q
+
+
 def _looks_like_panel_marker(answer):
     cleaned = answer.strip()
     if cleaned == "Not Applicable":
@@ -405,6 +446,25 @@ def _looks_like_panel_marker(answer):
     if len(cleaned) <= 3 and cleaned.replace(".", "").replace("-", "").isalpha():
         return True
     return False
+
+
+def _continuous_legend_verifier(model, processor, image_path):
+    """Probe whether the chart has a continuous legend (colorbar).
+    Returns True if colorbar present, False if not, None if uncertain."""
+    probe_prompt = chr(10).join([
+        "Look at this chart carefully.",
+        "Does this chart contain a continuous legend (also called a colorbar)?",
+        "A colorbar is a gradient bar mapping colors to numeric values.",
+        "A discrete legend listing category names is NOT a colorbar.",
+        "Answer exactly: Yes or No.",
+    ])
+    probe_answer = _run_single(model, processor, image_path, "", probe_prompt, variant="default")
+    lower = probe_answer.strip().lower()
+    if "yes" in lower and "no" not in lower:
+        return True
+    if "no" in lower:
+        return False
+    return None
 
 
 def _title_verifier(model, processor, image_path, question):
@@ -421,6 +481,12 @@ def vlm_inference(image_path, question="Describe this image in detail."):
     model, processor = _get_model()
     prompt = _build_prompt(question)
     base_answer = _run_single(model, processor, image_path, question, prompt, variant="default")
+
+    # Continuous legend verifier: if model returned a value but there's no colorbar
+    if _is_continuous_legend_question(question) and base_answer != "Not Applicable":
+        has_colorbar = _continuous_legend_verifier(model, processor, image_path)
+        if has_colorbar is False:
+            return "Not Applicable"
 
     if _is_title_question(question) and _looks_like_panel_marker(base_answer):
         verified = _title_verifier(model, processor, image_path, question)
