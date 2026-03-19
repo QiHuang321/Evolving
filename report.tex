@@ -336,7 +336,9 @@ Variant & Accuracy & Time (s/query) & Notes \\
 \texttt{evolved\_instruct} & 0.6094 & 0.261 & +7.0 pp over manual (evolution-discovered) \\
 \texttt{evolved\_thinking} & 0.5547 & 0.296 & evolved improvement over manual thinking \\
 \midrule
-\texttt{best\_accuracy}    & \textbf{0.7969} & 0.307 & evolved + fixes + title \& colorbar verifiers \\\texttt{best\_accuracy\_v2}& 0.7578 & 0.648 & evolved v2 (0.6094) + same fixes (back-port) \\\texttt{best\_speed}       & 0.5781 & 0.196$\pm$0.014 & batched inference, no image preprocessing$^\dagger$ \\
+\texttt{best\_accuracy}    & \textbf{0.7969} & 0.307 & evolved v1 + fixes + title \& colorbar verifiers \\
+\texttt{best\_accuracy\_v2}& 0.7578 & 0.648 & evolved v2 (0.6094) + same fixes (back-port) \\
+\texttt{best\_speed}       & 0.5781 & 0.196$\pm$0.014 & batched inference, no image preprocessing$^\dagger$ \\
 \texttt{best\_overall}     & 0.7813 & 0.305 & evolved + fixes + colorbar verifier \\
 \bottomrule
 \end{tabular}
@@ -345,7 +347,10 @@ Variant & Accuracy & Time (s/query) & Notes \\
 {\small $^\dagger$Batched path processes 4 questions per forward pass.
 Timing is
 warm-start mean$\pm$std over 6 back-to-back runs
-(cold-start first run excluded; cold-start = 0.549~s/query).
+(cold-start first run excluded; cold-start = 0.46--0.55~s/query due to
+one-time model loading and CUDA kernel compilation).
+A single \texttt{python evaluate.py best\_speed} invocation reports
+cold-start timing; the warm-start figure requires multiple consecutive runs.
 All timing starts before the first inference call and stops after the last.}
 \end{table}
 
@@ -545,7 +550,10 @@ For the single-query variants we report a single representative run.
 For \texttt{best\_speed} we report the mean$\pm$std of 6 consecutive
 warm-start runs (excluding a cold-start first run that includes one-time
 model and CUDA-kernel caching): \textbf{0.196$\pm$0.014~s/query}
-(cold-start: 0.549~s/query).
+(cold-start: 0.46--0.55~s/query depending on hardware state).
+A single \texttt{python evaluate.py best\_speed} invocation measures
+cold-start timing; the warm-start figure requires the multi-run loop in
+\texttt{reproduce.sh}.
 The evaluator includes a length check
 (\texttt{len(responses) == len(questions)}) to ensure batched results are
 never silently truncated.
