@@ -39,7 +39,7 @@ All numbers below use greedy decoding on the 128-example CharXiv descriptive val
 | `best_overall` | **0.7813** | 0.305 | best accuracy/speed tradeoff |
 | `best_speed` | 0.5781 | **0.196 ± 0.014** | batched warm-start path |
 
-<sub>Warm-start mean±std over 6 back-to-back runs; cold-start: 0.46–0.55 s/query.</sub>
+<sub>Warm-start mean±std over 6 back-to-back runs; cold-start: 0.46–0.55 s/query. All timing on A100-80GB; absolute latencies vary by hardware.</sub>
 
 ### Two-Layer Headline
 

@@ -352,7 +352,9 @@ warm-start mean$\pm$std over 6 back-to-back runs
 one-time model loading and CUDA kernel compilation).
 A single \texttt{python evaluate.py best\_speed} invocation reports
 cold-start timing; the warm-start figure requires multiple consecutive runs.
-All timing starts before the first inference call and stops after the last.}
+All timing starts before the first inference call and stops after the last.
+All timing numbers were measured on a single A100-80GB GPU; absolute
+latencies will vary across hardware configurations.}
 \end{table}
 
 Table~\ref{tab:progression} shows the incremental accuracy gains that built
