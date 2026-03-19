@@ -59,9 +59,22 @@ BLOCK_END   = "# EVOLVE-BLOCK-END"
 # Cascaded evaluation settings
 PRESCREEN_SAMPLES = 16
 PRESCREEN_THRESHOLD = 0.7
+PRESCREEN_STRATIFIED = True   # stratified random sampling (not fixed first-16)
 
 # Dual-mode mutation
 DIFF_MUTATION_PROB = 0.5
+
+# Known parser regression tests — cheap phase-0 sanity checks.
+REGRESSION_TESTS = [
+    ("spatially lowest labeled tick", "-1.00", "-1.00"),
+    ("spatially lowest labeled tick", "10^-6", "10^-6"),
+    ("leftmost labeled tick", "SSM", "SSM"),
+    ("how many discrete labels are there in the legend", "cat, dog, bird", "3"),
+    ("general trend of data from left to right", "increasing", "increases"),
+    ("layout of the subplots", "2 by 3", "2 by 3"),
+    ("maximum value of the tick labels on the continuous legend",
+     "There is no colorbar in this chart", "Not Applicable"),
+]
 
 # ── Data structures ─────────────────────────────────────────────────────────────
 
@@ -93,12 +106,77 @@ class Program:
 CHARXIV_PATH = Path(__file__).parent / "charxiv"
 sys.path.insert(0, str(CHARXIV_PATH / "src"))
 
+# Shared model/processor: loaded once and injected into candidate modules.
+_SHARED_MODEL = None
+_SHARED_PROCESSOR = None
+
+
+def _init_shared_model():
+    """Load the VLM once so candidates don't each pay the load cost."""
+    global _SHARED_MODEL, _SHARED_PROCESSOR
+    if _SHARED_MODEL is not None:
+        return
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+    model_name = "Qwen/Qwen3-VL-2B-Thinking"
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    if not torch.cuda.is_available():
+        dtype = torch.float32
+    _SHARED_MODEL = AutoModelForImageTextToText.from_pretrained(
+        model_name, dtype=dtype, device_map="auto",
+    )
+    _SHARED_MODEL.eval()
+    _SHARED_PROCESSOR = AutoProcessor.from_pretrained(model_name, use_fast=False)
+    print(f"  [shared model] Loaded {model_name} ({dtype})")
+
+
+def _classify_question(question: str) -> str:
+    """Map a question to a coarse question-type for MAP-Elites descriptors."""
+    q = " ".join(question.lower().split())
+    if "continuous legend" in q:
+        return "colorbar"
+    if "legend" in q:
+        return "legend"
+    if "layout of the subplots" in q or "number of subplots" in q:
+        return "layout"
+    if any(p in q for p in ["leftmost", "rightmost", "lowest", "highest",
+                            "tick values", "tick labels", "how many"]):
+        return "numeric"
+    if "title" in q:
+        return "title"
+    if "label of the" in q or "axis" in q:
+        return "axis"
+    if "trend" in q or "intersect" in q:
+        return "trend"
+    return "other"
+
+
+def _stratified_sample(query_keys: list, n: int) -> list:
+    """Stratified random sample of n keys, proportional to question-type bins."""
+    type_bins: dict[str, list] = {}
+    for key in query_keys:
+        qt = _CACHED_QTYPE.get(key, "other")
+        type_bins.setdefault(qt, []).append(key)
+    total = len(query_keys)
+    selected = []
+    for qt, keys in type_bins.items():
+        k = max(1, round(n * len(keys) / total))
+        selected.extend(random.sample(keys, min(k, len(keys))))
+    if len(selected) > n:
+        selected = random.sample(selected, n)
+    elif len(selected) < n:
+        remaining = [k for k in query_keys if k not in set(selected)]
+        selected.extend(random.sample(remaining, min(n - len(selected), len(remaining))))
+    return selected
+
+
 _CACHED_QUERIES = None
 _CACHED_GT = None
+_CACHED_QTYPE = None
 
 
 def _get_queries():
-    global _CACHED_QUERIES, _CACHED_GT
+    global _CACHED_QUERIES, _CACHED_GT, _CACHED_QTYPE
     if _CACHED_QUERIES is None:
         from descriptive_utils import build_descriptive_quries
         with open(CHARXIV_PATH / "data" / "descriptive_val.json") as f:
@@ -106,6 +184,9 @@ def _get_queries():
         queries = build_descriptive_quries(data, str(CHARXIV_PATH / "images"))
         _CACHED_QUERIES = dict(list(queries.items())[:EVAL_NUM_SAMPLES])
         _CACHED_GT = data
+        _CACHED_QTYPE = {}
+        for key, q in _CACHED_QUERIES.items():
+            _CACHED_QTYPE[key] = _classify_question(q["question"])
     return _CACHED_QUERIES, _CACHED_GT
 
 
@@ -123,7 +204,30 @@ def evaluate_program(program: Program, parent_accuracy: float = 0.0) -> Program:
     try:
         spec = importlib.util.spec_from_file_location("_evolved_candidate", tmp_path)
         mod = importlib.util.module_from_spec(spec)
+
+        # Inject shared model so candidates don't reload from scratch
+        if _SHARED_MODEL is not None:
+            mod._MODEL = _SHARED_MODEL
+            mod._PROCESSOR = _SHARED_PROCESSOR
+
         spec.loader.exec_module(mod)
+
+        # ── Phase 0: Regression tests ──
+        if parent_accuracy > 0 and hasattr(mod, '_normalize_answer'):
+            for q_snippet, raw_out, expected in REGRESSION_TESTS:
+                try:
+                    result = mod._normalize_answer(q_snippet, raw_out)
+                    if result != expected:
+                        program.accuracy = 0.0
+                        program.avg_time = 999.0
+                        program.score = 0.0
+                        program.eval_error = (f"regression test fail: "
+                            f"normalize_answer({q_snippet!r}, {raw_out!r}) "
+                            f"= {result!r}, expected {expected!r}")
+                        print(f"  [regression] FAIL: {program.eval_error}")
+                        return program
+                except Exception:
+                    pass
 
         responses = {}
         num_errors = 0
@@ -151,7 +255,11 @@ def evaluate_program(program: Program, parent_accuracy: float = 0.0) -> Program:
 
         # ── Phase 2: Pre-screen ──
         if parent_accuracy > 0:
-            for key in query_keys[:PRESCREEN_SAMPLES]:
+            if PRESCREEN_STRATIFIED:
+                _prescreen_keys = _stratified_sample(query_keys, PRESCREEN_SAMPLES)
+            else:
+                _prescreen_keys = query_keys[:PRESCREEN_SAMPLES]
+            for key in _prescreen_keys:
                 if key in responses:
                     continue
                 try:
@@ -166,7 +274,7 @@ def evaluate_program(program: Program, parent_accuracy: float = 0.0) -> Program:
 
             pre_correct = 0
             pre_total = 0
-            for key in query_keys[:PRESCREEN_SAMPLES]:
+            for key in _prescreen_keys:
                 figure_id, subq_idx = key.split("_")
                 gt_entry = gt_data.get(figure_id)
                 if gt_entry is None:
@@ -208,6 +316,9 @@ def evaluate_program(program: Program, parent_accuracy: float = 0.0) -> Program:
         correct = 0
         total = 0
         behavior_bits = []
+        type_correct: dict[str, int] = {}
+        type_total: dict[str, int] = {}
+        na_tp = na_fp = na_fn = na_tn = 0
         for key in query_keys:
             figure_id, subq_idx = key.split("_")
             gt_entry = gt_data.get(figure_id)
@@ -220,10 +331,35 @@ def evaluate_program(program: Program, parent_accuracy: float = 0.0) -> Program:
                 correct += 1
             behavior_bits.append(1 if is_correct else 0)
             total += 1
+            qt = _CACHED_QTYPE.get(key, "other")
+            type_correct[qt] = type_correct.get(qt, 0) + (1 if is_correct else 0)
+            type_total[qt] = type_total.get(qt, 0) + 1
+            pred_na = resp.strip().lower() == "not applicable"
+            gt_na = gt_answer.lower() == "not applicable"
+            if pred_na and gt_na:
+                na_tp += 1
+            elif pred_na and not gt_na:
+                na_fp += 1
+            elif not pred_na and gt_na:
+                na_fn += 1
+            else:
+                na_tn += 1
 
         program.accuracy = correct / total if total > 0 else 0.0
         program.avg_time = total_time / total if total > 0 else 999.0
-        program.behavior = tuple(behavior_bits)
+
+        def _bin5(x):
+            return min(4, int(x * 5))
+
+        descriptor = []
+        for qt in sorted(type_total.keys()):
+            acc = type_correct.get(qt, 0) / type_total[qt] if type_total.get(qt) else 0
+            descriptor.append(_bin5(acc))
+        na_prec = na_tp / (na_tp + na_fp) if (na_tp + na_fp) > 0 else 1.0
+        descriptor.append(_bin5(na_prec))
+        na_rec = na_tp / (na_tp + na_fn) if (na_tp + na_fn) > 0 else 1.0
+        descriptor.append(_bin5(na_rec))
+        program.behavior = tuple(descriptor)
 
         baseline_time = 3.5
         speed_bonus = max(0.0, min(1.0, (baseline_time - program.avg_time) / baseline_time))
@@ -488,19 +624,19 @@ class Population:
 # ── Behavioral diversity archive ────────────────────────────────────────────────
 
 class FeatureArchive:
-    """Lightweight MAP-Elites-style behavioral diversity archive."""
+    """MAP-Elites behavioral diversity archive with low-dimensional descriptors."""
 
-    def __init__(self, max_size: int = 20):
+    def __init__(self, max_size: int = 50):
         self.max_size = max_size
-        self._archive: dict[int, Program] = {}
+        self._archive: dict[tuple, Program] = {}
 
     def add(self, program: Program):
         if not program.behavior or (program.score or 0) <= 0:
             return
-        bh = hash(program.behavior)
-        existing = self._archive.get(bh)
+        cell = program.behavior
+        existing = self._archive.get(cell)
         if existing is None or (program.score or 0) > (existing.score or 0):
-            self._archive[bh] = program
+            self._archive[cell] = program
         if len(self._archive) > self.max_size:
             worst_key = min(self._archive, key=lambda k: self._archive[k].score or 0)
             del self._archive[worst_key]
@@ -548,6 +684,9 @@ def main():
 
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+    # Pre-load the VLM once so candidate modules share it.
+    _init_shared_model()
+
     print(f"=== AlphaEvolve for Qwen3-VL-2B-Thinking ===")
     print(f"  Population: {POPULATION_SIZE} ({NUM_ISLANDS} islands x {POPULATION_SIZE//NUM_ISLANDS})")
     print(f"  Max generations: {MAX_GENERATIONS}")
@@ -556,7 +695,7 @@ def main():
     print()
 
     population = Population(num_islands=NUM_ISLANDS, island_size=POPULATION_SIZE // NUM_ISLANDS)
-    archive = FeatureArchive(max_size=20)
+    archive = FeatureArchive(max_size=50)
 
     print("[Gen 0] Evaluating seed program (manual_thinking.py) ...")
     seed_code = SEED_FILE.read_text()

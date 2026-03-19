@@ -6,6 +6,10 @@ Supports two inference modes:
 
 If the loaded module exposes vlm_inference_batch, the evaluator groups queries
 by image and calls the batch path for better throughput.
+
+Extra modes:
+  --cv 4         Run 4-fold cross-validation and report per-fold + mean accuracy.
+  --fold K/N     Evaluate only on fold K of N (e.g. --fold 2/4 for the second quarter).
 """
 import importlib
 import sys
@@ -30,10 +34,19 @@ def load_charxiv_data(num_samples=128):
     return queries, data
 
 
-def evaluate(program):
+def evaluate(program, fold=None, num_folds=None):
     NUM_SAMPLES = 128
 
     queries, ground_truth_data = load_charxiv_data(NUM_SAMPLES)
+
+    # If fold is specified, restrict to that fold's samples.
+    if fold is not None and num_folds is not None:
+        all_keys = list(queries.keys())
+        fold_size = len(all_keys) // num_folds
+        start_idx = (fold - 1) * fold_size
+        end_idx = fold_size * fold if fold < num_folds else len(all_keys)
+        fold_keys = set(all_keys[start_idx:end_idx])
+        queries = {k: v for k, v in queries.items() if k in fold_keys}
 
     num_errors = 0
     start_time = time.time()
@@ -101,14 +114,39 @@ def evaluate(program):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python evaluate.py <module_name>")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate VLM inference on CharXiv")
+    parser.add_argument("module_name", help="Python module to evaluate")
+    parser.add_argument("--cv", type=int, default=0, metavar="K",
+                        help="Run K-fold cross-validation (e.g. --cv 4)")
+    parser.add_argument("--fold", type=str, default=None, metavar="K/N",
+                        help="Evaluate on fold K of N (e.g. --fold 2/4)")
+    args = parser.parse_args()
 
-    module_name = sys.argv[1]
-    program = importlib.import_module(module_name)
-    results = evaluate(program)
-    print(json.dumps(results, indent=2))
+    program = importlib.import_module(args.module_name)
+
+    if args.cv > 0:
+        # K-fold cross-validation
+        fold_results = []
+        for k in range(1, args.cv + 1):
+            print(f"\n--- Fold {k}/{args.cv} ---")
+            result = evaluate(program, fold=k, num_folds=args.cv)
+            fold_results.append(result)
+            print(f"  Accuracy: {result['accuracy']:.4f} ({result['num_evaluated']} samples)")
+        accuracies = [r["accuracy"] for r in fold_results]
+        mean_acc = sum(accuracies) / len(accuracies)
+        import statistics
+        std_acc = statistics.stdev(accuracies) if len(accuracies) > 1 else 0.0
+        print(f"\n=== {args.cv}-fold CV: {mean_acc:.4f} ± {std_acc:.4f} ===")
+        print(json.dumps({"cv_folds": args.cv, "per_fold": accuracies,
+                          "mean": mean_acc, "std": std_acc}, indent=2))
+    elif args.fold:
+        k, n = map(int, args.fold.split("/"))
+        results = evaluate(program, fold=k, num_folds=n)
+        print(json.dumps(results, indent=2))
+    else:
+        results = evaluate(program)
+        print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":

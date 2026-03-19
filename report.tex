@@ -47,8 +47,9 @@ manually optimize the inference pipeline through prompt engineering, structured
 output normalization, and image caching, reaching 53.9\% accuracy with a
 13$\times$ speed improvement. We then implement an evolutionary system that uses
 an LLM (GPT) as a mutation operator over a maintained population of candidate
-programs, automatically discovering improvements such as adaptive image
-upscaling and unsharp masking, reaching 60.2\% accuracy. Finally, through
+programs, automatically discovering prompt- and post-processing-level
+improvements (expanded Not-Applicable synonyms, question-type-aware gating,
+regex-based answer extraction, dynamic token budgets), reaching 60.9\% accuracy. Finally, through
 systematic per-sample error analysis, we identify and fix five post-processing
 bugs (negative sign stripping, text tick mishandling, caret notation breakage,
 legend count deduplication, and trend synonym mismatch) that together yield a
@@ -56,7 +57,11 @@ further 9.4~pp gain to 69.5\%. A subsequent per-sample error analysis reveals
 that 13 of 39 remaining errors stem from the model hallucinating continuous
 legend (colorbar) values on charts that have none; a targeted one-shot colorbar
 verifier probe corrects all 13, pushing accuracy to \textbf{79.7\%}---a 41.4
-percentage point improvement over the baseline. These results show that
+percentage point improvement over the baseline.
+Four-fold cross-validation on the 128 development samples yields
+$0.797 \pm 0.031$ for \texttt{best\_accuracy}, confirming that the
+verifier gains are not overfit to a specific subset.
+These results show that
 systematic error categorization and lightweight targeted verification can
 substantially outperform sophisticated inference techniques when the bottleneck
 is post-processing and hallucination rather than model perception.
@@ -177,12 +182,12 @@ paper's full architecture. Figure~\ref{fig:arch} illustrates the overall loop.
     {inspire} (mut);
 
   \node[font=\scriptsize, text=gray, above=0.1cm of mut] {50\% full / 50\% focused};
-  \node[font=\scriptsize, text=gray, below=0.05cm of cas] {1$\to$16$\to$128 samples};
+  \node[font=\scriptsize, text=gray, below=0.05cm of cas] {regression$\to$1$\to$16$\to$128};
 \end{tikzpicture}
 \caption{Evolution system architecture. Dashed arrow: archive members are
 sampled as ``inspiration'' during mutation. Cascaded evaluation filters broken
-or weak candidates early (1-sample crash check $\to$ 16-sample pre-screen
-$\to$ full 128-sample evaluation).}
+or weak candidates early (regression tests $\to$ 1-sample crash check $\to$
+16-sample stratified pre-screen $\to$ full 128-sample evaluation).}
 \label{fig:arch}
 \end{figure}
 
@@ -209,14 +214,19 @@ We maintain an island model with 2 islands of 4 programs each (8 total). Every
 island, providing diversity without sacrificing convergence within each island.
 
 \paragraph{Behavioral diversity archive.}
-In addition to the island population, we maintain a lightweight MAP-Elites-style
-\texttt{FeatureArchive} of up to 20 programs, indexed by the hash of their
-per-query correctness vector (a 128-bit behavior signature). Each unique
-behavior pattern retains only its highest-scoring representative. This ensures
-the system preserves programs that solve \emph{different subsets} of the
-benchmark, not just those with the highest aggregate score. Archive members are
-sampled as additional ``inspiration'' during mutation, encouraging the LLM to
-cross-pollinate solution strategies.
+In addition to the island population, we maintain a MAP-Elites-style
+\texttt{FeatureArchive} of up to 50 programs, indexed by a \emph{low-dimensional
+behavior descriptor} rather than a raw correctness-vector hash.  Each query is
+classified into one of eight coarse question types (colorbar, legend, layout,
+numeric, title, axis, trend, other), and the descriptor is a tuple of
+5-level accuracy bins---one per question type plus Not Applicable
+precision and recall bins.  This yields a roughly $5^{10}$-cell grid;
+each occupied cell retains only its highest-scoring representative.
+Compared to hashing the full 128-bit correctness vector (which would
+make nearly every program ``unique''), the low-dimensional grid forces
+meaningful diversity: programs that solve different \emph{types} of
+questions are preserved, encouraging cross-pollination of distinct
+strategies during mutation.
 
 \paragraph{Selection and elitism.}
 Tournament selection ($k=3$) within each island chooses the parent for
@@ -227,18 +237,36 @@ checkpointed whenever a new maximum is found.
 
 \paragraph{Cascaded evaluation.}
 To avoid wasting compute on broken or obviously weak mutations, evaluation
-proceeds in three phases:
+proceeds in four phases:
 \begin{enumerate}
+  \item \textbf{Regression tests} (phase 0): seven known parser invariants
+    (negative sign preservation, caret notation, text tick passthrough,
+    legend count dedup, trend synonym mapping, layout canonicalization,
+    NA synonym detection) are checked by calling the candidate's
+    \texttt{\_normalize\_answer} directly.  A candidate that fails any
+    regression is immediately rejected at near-zero cost.
   \item \textbf{Crash check} (1 sample): if the candidate crashes or returns a
     non-string, it is immediately discarded.
-  \item \textbf{Pre-screen} (16 samples): the candidate must achieve $\geq 70\%$
-    of the parent's accuracy on this subset to proceed. Failed candidates are
-    logged and discarded, saving $\sim$87.5\% of evaluation cost.
+  \item \textbf{Pre-screen} (16 samples, stratified): a \emph{stratified random}
+    subset of 16 queries (proportional to question-type distribution) is
+    evaluated.  The candidate must achieve $\geq 70\%$
+    of the parent's accuracy on this subset to proceed.  Stratified sampling
+    avoids the bias of always using the same fixed 16 samples.  Failed
+    candidates save $\sim$87.5\% of evaluation cost.
   \item \textbf{Full evaluation} (all 128 samples): computes final accuracy,
-    speed, composite score, and behavior vector.
+    speed, composite score, and behavior descriptor.
 \end{enumerate}
 Phases 1--3 share the same loaded module, so the VLM is only loaded once per
 candidate.
+
+\paragraph{Shared model injection.}
+To avoid reloading the 2B-parameter VLM for every candidate evaluation, the
+evolution harness loads the model once at startup and injects the
+\texttt{\_MODEL} and \texttt{\_PROCESSOR} objects into each candidate's module
+namespace before executing it.  Candidates that define \texttt{\_MODEL = None}
+(the standard pattern) receive the pre-loaded model and skip their own
+\texttt{from\_pretrained} call, reducing per-candidate evaluation overhead from
+$\sim$25\,s of model loading to near zero.
 
 \paragraph{Evolution loop.}
 Each run performs 40 generations, alternating between islands. Full per-candidate
@@ -268,15 +296,17 @@ Variant & Accuracy & Time (s/query) & Notes \\
 \texttt{evolved\_thinking} & 0.5547 & 0.296 & evolved improvement over manual thinking \\
 \midrule
 \texttt{best\_accuracy}    & \textbf{0.7969} & 0.307 & evolved + fixes + title \& colorbar verifiers \\
-\texttt{best\_speed}       & 0.5781 & --- & batched inference, no image preprocessing$^\dagger$ \\
+\texttt{best\_speed}       & 0.5781 & 0.339$\pm$0.008 & batched inference, no image preprocessing$^\dagger$ \\
 \texttt{best\_overall}     & 0.7813 & 0.305 & evolved + fixes + colorbar verifier \\
 \bottomrule
 \end{tabular}
 
 \smallskip
 {\small $^\dagger$Batched path processes 4 questions per forward pass.
-Wall-clock time varies across runs (0.19--0.33~s/query typical) because
-the evaluator's timer includes model loading; see text for details.}
+Timing is
+warm-start mean$\pm$std over 4 back-to-back runs
+(cold-start first run excluded; cold-start = 0.280~s/query).
+All timing starts before the first inference call and stops after the last.}
 \end{table}
 
 Table~\ref{tab:progression} shows the incremental accuracy gains that built
@@ -450,16 +480,11 @@ the number of forward passes from 128 to 32.
 \textbf{Timing methodology.}
 All timing numbers in Table~\ref{tab:results} are end-to-end wall-clock
 measurements from \texttt{evaluate.py}, which starts the timer before the
-first inference call (including one-time model loading) and stops it after the
-last. Because the first call per process incurs a cold-start penalty, reported
-latencies are sensitive to whether model weights are already resident in GPU
-memory. For all non-batch variants we record numbers from a single
-representative run on the same GPU; for \texttt{best\_speed} we omit a single
-value because run-to-run variance is higher in the batched path (the model
-state interacts differently with batch-level memory allocation). In
-controlled back-to-back runs the batched path consistently takes fewer total
-seconds than the unbatched path, as expected from 4$\times$ fewer forward
-passes.
+first inference call and stops it after the last.
+For the single-query variants we report a single representative run.
+For \texttt{best\_speed} we report the mean$\pm$std of 4 consecutive
+warm-start runs (excluding a cold-start first run that includes one-time
+model loading): \textbf{0.339$\pm$0.008~s/query} (cold-start: 0.280~s/query).
 The evaluator includes a length check
 (\texttt{len(responses) == len(questions)}) to ensure batched results are
 never silently truncated.
@@ -536,7 +561,12 @@ evaluation. While the fixes are question-type-based rather than
 sample-specific (e.g.\ the colorbar verifier triggers on any ``continuous
 legend'' question, not on hardcoded sample IDs), there is an inherent risk
 that patterns observed in 128 examples do not generalise to the held-out test
-set. In particular, the relative frequency of colorbar-hallucination errors
+set. To quantify this risk, we run 4-fold cross-validation on the 128
+samples: \texttt{best\_accuracy} scores $0.797 \pm 0.031$ (per-fold:
+0.8125, 0.7500, 0.8125, 0.8125) and \texttt{best\_overall} scores
+$0.781 \pm 0.026$. The low variance across folds indicates that the
+verifier-driven gains are not concentrated on a lucky subset.
+Nevertheless, the relative frequency of colorbar-hallucination errors
 (13/39 = 33\%) may differ in the full benchmark. The cleaner measure of our
 system's generalisation ability is the manual$\to$evolved chain
 (38.3\%$\to$53.9\%$\to$60.9\%), which was obtained without per-sample

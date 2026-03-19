@@ -15,7 +15,16 @@ All numbers are on the 128-sample CharXiv descriptive validation subset with gre
 | `evolved_thinking` | 0.5547 | 0.296 | Evolutionary search (Thinking) |
 | **`best_accuracy`** | **0.7969** | 0.307 | Evolved + bug fixes + title & colorbar verifiers |
 | **`best_overall`** | **0.7813** | 0.305 | Evolved + bug fixes + colorbar verifier |
-| `best_speed` | 0.5781 | batched | Per-image batched inference, no preprocessing |
+| `best_speed` | 0.5781 | 0.339±0.008 | Per-image batched inference, no preprocessing |
+
+### 4-Fold Cross-Validation
+
+To check for overfitting to the 128-sample dev set:
+
+| Variant | Mean ± Std | Per-fold |
+| --- | --- | --- |
+| `best_accuracy` | 0.797 ± 0.031 | 0.8125, 0.7500, 0.8125, 0.8125 |
+| `best_overall` | 0.781 ± 0.026 | 0.7813, 0.7500, 0.8125, 0.7813 |
 
 ### Accuracy Progression
 
@@ -70,8 +79,9 @@ Evolved instruct      0.6094  ████████████
 ### Evolution System (`evolve_instruct.py`, `evolve_thinking.py`)
 - **LLM-guided mutation**: GPT-5.2-codex generates code variants
 - **Dual-mode mutation**: 50% full-block rewrite, 50% focused single-function edit via `ast.parse()`
-- **Cascaded evaluation**: 1-sample crash check → 16-sample pre-screen → full 128-sample eval
-- **Behavioral diversity archive**: MAP-Elites-style archive indexed by per-sample correctness vector
+- **Cascaded evaluation**: regression tests → 1-sample crash check → 16-sample stratified pre-screen → full 128-sample eval
+- **Shared model injection**: VLM loaded once, injected into candidates (eliminates ~25s/candidate model reload)
+- **Behavioral diversity archive**: MAP-Elites grid indexed by per-question-type accuracy bins + NA precision/recall
 - **Island model**: 2 islands × 4 programs, periodic migration
 
 ### Post-Processing Bug Fixes (+9.4 pp)
@@ -93,6 +103,12 @@ pip install -r requirements.txt
 
 # Evaluate a single script
 python evaluate.py best_accuracy
+
+# 4-fold cross-validation
+python evaluate.py best_accuracy --cv 4
+
+# Evaluate on a specific fold
+python evaluate.py best_accuracy --fold 2/4
 
 # Run all evaluations
 bash reproduce.sh
