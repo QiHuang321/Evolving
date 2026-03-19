@@ -8,6 +8,7 @@
 \usepackage{booktabs}
 \usepackage{amsmath}
 \usepackage{amsfonts}
+\usepackage{amssymb}
 \usepackage{microtype}
 \usepackage{xcolor}
 \usepackage{listings}
@@ -276,6 +277,43 @@ Each run performs 40 generations, alternating between islands. Full per-candidat
 results (including behavior vectors) are appended under
 \texttt{artifacts/evolution\_logs/} for post-hoc analysis.
 
+\paragraph{Relationship to AlphaEvolve.}
+Table~\ref{tab:alphaevolve} summarises which components of the full AlphaEvolve
+architecture we implement and which we omit.  Our system covers the core loop
+(LLM mutation $\to$ evaluation $\to$ selection) and adds three
+AlphaEvolve-inspired extensions: dual-mode mutation (full/focused, analogous to
+AlphaEvolve's diff-based prompting), an island population model, and a
+MAP-Elites-style diversity archive.  Components we omit include Pareto
+multi-objective optimisation (we use a single weighted scalar), binary
+tournament metrics selection across multiple evaluation metrics, adaptive
+mutation temperature, and multi-LLM ensembles.  Our fitness function conflates
+accuracy and speed into one score rather than maintaining a Pareto frontier,
+and we use a single mutation model (GPT-5.2-codex) rather than the ensemble of
+models described in the AlphaEvolve paper.
+
+\begin{table}[h]
+\centering
+\caption{Comparison with AlphaEvolve architecture.}
+\label{tab:alphaevolve}
+\small
+\begin{tabular}{lcc}
+\toprule
+Component & AlphaEvolve & Ours \\
+\midrule
+LLM-based code mutation       & \checkmark & \checkmark \\
+Diff-based (focused) mutation  & \checkmark & \checkmark (50\%) \\
+Full-program rewrite           & \checkmark & \checkmark (50\%) \\
+Population with selection      & \checkmark & \checkmark (island model) \\
+MAP-Elites diversity archive   & \checkmark & \checkmark (low-dim) \\
+Cascaded evaluation            & \checkmark & \checkmark (4-phase) \\
+Multi-objective Pareto         & \checkmark & $\times$ (weighted scalar) \\
+Multi-LLM ensemble             & \checkmark & $\times$ (single model) \\
+Adaptive mutation temperature  & \checkmark & $\times$ \\
+Binary tournament on metrics   & \checkmark & $\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Results}
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -298,8 +336,7 @@ Variant & Accuracy & Time (s/query) & Notes \\
 \texttt{evolved\_instruct} & 0.6094 & 0.261 & +7.0 pp over manual (evolution-discovered) \\
 \texttt{evolved\_thinking} & 0.5547 & 0.296 & evolved improvement over manual thinking \\
 \midrule
-\texttt{best\_accuracy}    & \textbf{0.7969} & 0.307 & evolved + fixes + title \& colorbar verifiers \\
-\texttt{best\_speed}       & 0.5781 & 0.196$\pm$0.014 & batched inference, no image preprocessing$^\dagger$ \\
+\texttt{best\_accuracy}    & \textbf{0.7969} & 0.307 & evolved + fixes + title \& colorbar verifiers \\\texttt{best\_accuracy\_v2}& 0.7578 & 0.648 & evolved v2 (0.6094) + same fixes (back-port) \\\texttt{best\_speed}       & 0.5781 & 0.196$\pm$0.014 & batched inference, no image preprocessing$^\dagger$ \\
 \texttt{best\_overall}     & 0.7813 & 0.305 & evolved + fixes + colorbar verifier \\
 \bottomrule
 \end{tabular}
@@ -424,12 +461,32 @@ outputs vs.\ post-processed answers. We identified five bugs:
     count; we now split, deduplicate, and count.
 \end{enumerate}
 
-\paragraph{Instruct vs.\ Thinking.}
+\paragraph{Instruct vs.\ Thinking: complementary error profiles.}
 The Instruct model consistently outperforms the Thinking model across both
-manual and evolved variants. The Thinking model's chain-of-thought mechanism is
-a liability for exact-match short-answer tasks: even with reasoning suppressed,
-it is more sensitive to prompt phrasing and occasionally produces longer
-responses that fail normalization.
+manual and evolved variants. To understand \emph{why}, we ran a head-to-head
+comparison on all 128 development samples, categorising each sample by whether
+Instruct-only was correct, Thinking-only was correct, or both were wrong.
+
+Of 128 samples: both correct on 43, Instruct-only correct on \textbf{26},
+Thinking-only correct on \textbf{22}, and both wrong on 37. The net +4 for
+Instruct masks a pronounced \emph{complementary error profile}:
+\begin{itemize}
+  \item \textbf{Instruct wins on value-extraction questions} (+24):
+    the Instruct model reliably reads tick values, axis labels, and
+    intersection points (e.g.\ correctly answering ``60'', ``0.1'', ``1.2''),
+    while the Thinking model returns ``Not Applicable'' for the same charts,
+    likely because its chain-of-thought reasoning introduces excessive caution.
+  \item \textbf{Thinking wins on absence-detection (NA) questions} (+18):
+    conversely, the Thinking model correctly identifies charts with no
+    colorbar, no legend, or no title, answering ``Not Applicable'' where the
+    Instruct model hallucinates values.
+\end{itemize}
+In other words, the 2B Thinking model's caution is a \emph{liability} for
+value extraction but an \emph{asset} for absence detection. This suggests
+that an ensemble routing strategy---using the Thinking model as a
+``null-hypothesis verifier'' and the Instruct model for value extraction---could
+combine both strengths, though we did not implement this due to the added
+latency of running two models.
 
 \paragraph{Test-time augmentation (TTA).}
 We explored multi-view TTA---generating answers from multiple image
@@ -558,6 +615,52 @@ Of the 26 remaining errors (out of 128), the dominant categories are:
 These are model perception limits of the 2B parameter VLM, not fixable through
 post-processing.
 
+\paragraph{Retrospective ablation of evolution components.}
+To assess the contribution of individual AlphaEvolve-inspired mechanisms, we
+perform a retrospective analysis of the 29-candidate second evolution run (which
+includes mode tracking, behavior vectors, and cascade metadata).
+We also provide ablation scripts (\texttt{ablation\_no\_archive.py},
+\texttt{ablation\_no\_cascade.py}) that can be re-run with API
+access.
+
+\emph{Cascaded evaluation.} Of 29 candidates, 9 (31\%) crashed at runtime
+(e.g.\ FlashAttention2 import failures, module attribute errors).
+Without the cascade, each crash would consume a full 128-sample evaluation
+($\sim$240\,s); the cascade catches these in the 1-sample crash check
+($\sim$5\,s), saving an estimated \textbf{35 minutes} of wasted GPU time.
+The 16-sample stratified pre-screen further filters weak-but-non-crashing
+mutations before committing to full evaluation.
+
+\emph{Behavioral diversity archive.} Across 20 successful evaluations, the
+archive recorded \textbf{13 unique behavior descriptors}, indicating that
+programs solving different question-type mixes were preserved. Archive members
+are sampled during mutation to provide diverse ``inspiration''---without the
+archive, the mutation LLM sees only the (convergent) island population.
+
+\emph{Dual-mode mutation.}
+Of 11 focused mutations, 3 crashed (27\%); of 18 full-rewrite mutations,
+6 crashed (33\%). Among successful candidates, the best-ever program
+(0.6094, gen 37) was produced by a \emph{focused} mutation, supporting
+the hypothesis that surgical edits are safer and can refine near-optimal
+programs that full rewrites would disrupt. In the earlier run 1 (37
+candidates, no cascade), the best reached only 0.6016 at generation
+38---suggesting that cascaded evaluation and archive-informed mutation
+contributed to the 0.8-pp improvement in run 2.
+
+\paragraph{Back-porting post-processing fixes.}
+Table~\ref{tab:progression} notes that \texttt{best\_accuracy} was built on the
+v1 evolved base (0.6016). We back-ported all post-processing fixes and
+verifiers onto the latest evolved base (0.6094) in
+\texttt{best\_accuracy\_v2.py}. The result: \textbf{0.7578} (97/128)---higher
+than the v1 base alone (0.6016) but 3.9~pp \emph{lower} than the original
+\texttt{best\_accuracy} (0.7969). This gap indicates that the post-processing
+fixes were partially tuned to the v1 evolved code's specific output patterns;
+the v2 evolved code's broader NA synonym list and ``answer is'' extractor
+interact differently with the verifiers, causing some over-corrections.
+This finding highlights a general risk of manual post-processing:
+improvements developed against one code version may not compose cleanly
+with an independently evolved version.
+
 \paragraph{Limitations.}
 Our post-processing bug fixes and targeted verifiers (\S5) were developed by
 analysing individual errors on the same 128-sample development set used for
@@ -565,7 +668,9 @@ evaluation. While the fixes are question-type-based rather than
 sample-specific (e.g.\ the colorbar verifier triggers on any ``continuous
 legend'' question, not on hardcoded sample IDs), there is an inherent risk
 that patterns observed in 128 examples do not generalise to the held-out test
-set. To quantify this risk, we partition the 128 samples into four
+set. The back-porting experiment above reinforces this concern:
+post-processing tuned against one evolved base does not transfer perfectly
+to a different evolved base (0.7969 vs.\ 0.7578).  To quantify this risk, we partition the 128 samples into four
 non-overlapping folds and evaluate the \emph{same fixed program} on each.
 \texttt{best\_accuracy} scores $0.797 \pm 0.031$ (per-fold:
 0.8125, 0.7500, 0.8125, 0.8125) and \texttt{best\_overall} scores
@@ -593,10 +698,16 @@ diversity archive (\S4), but several avenues remain. Running more generations
 failing from generation 15 onward due to API quota exhaustion, so later
 generations effectively replayed existing parents),
 maintaining a larger population, or using a more capable mutation model could
-expand the search. Batched inference would further reduce evaluation cost per
+expand the search. Adding Pareto multi-objective optimisation and adaptive
+mutation temperature (Table~\ref{tab:alphaevolve}) would bring the system
+closer to the full AlphaEvolve architecture.  Batched inference would further reduce evaluation cost per
 generation. On the verification side, extending the targeted-probe strategy
 beyond colorbar to other hallucination-prone question types (e.g.\ tick
 counting, discrete legend existence) could close additional error categories.
+The complementary error profiles of Instruct and Thinking models (\S6)
+suggest an ensemble routing strategy: use the Thinking model's caution as a
+null-hypothesis verifier and the Instruct model for value extraction, combining
+both strengths without retraining.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Conclusion}
@@ -608,13 +719,24 @@ naive baseline and 7.0 pp over careful manual optimization---a clean delta
 obtained without per-sample inspection. Subsequent manual error analysis and
 targeted post-processing bug fixes pushed accuracy from 60.2\% to 69.5\%, and
 a colorbar-existence verifier corrected 13 of 39 remaining errors, reaching
-\textbf{79.7\%}---a 41.4 pp total improvement. The post-analysis gains carry
-an inherent overfitting risk to the 128-sample development set (\S6); the
-evolution-driven gains (38.3\%$\to$53.9\%$\to$60.9\%) represent the more
-conservative generalisation estimate. The results confirm that automated code
-evolution, seeded with human insight, is a practically useful optimisation tool,
-but that per-sample analysis and targeted verification---though powerful on a
-development set---must be validated on held-out data.
+\textbf{79.7\%}---a 41.4 pp total improvement. Retrospective ablation of the
+evolution logs shows that cascaded evaluation saved $\sim$35 minutes of wasted
+GPU time by catching 31\% of candidates that crashed at runtime, and the
+behavioral diversity archive preserved 13 distinct solution strategies across
+20 evaluations.  A head-to-head analysis reveals that Instruct and Thinking
+models have complementary error profiles (+24 vs +18 on value-extraction
+vs.\ absence-detection questions), suggesting an ensemble routing strategy
+as future work.  Back-porting the post-processing fixes to a newer evolved
+base yielded 0.7578 rather than 0.7969, highlighting that manual
+post-processing improvements are partially base-specific.
+
+The post-analysis gains carry an inherent overfitting risk to the 128-sample
+development set (\S6); the evolution-driven gains
+(38.3\%$\to$53.9\%$\to$60.9\%) represent the more conservative generalisation
+estimate. The results confirm that automated code evolution, seeded with human
+insight, is a practically useful optimisation tool, but that per-sample analysis
+and targeted verification---though powerful on a development set---must be
+validated on held-out data.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \bibliographystyle{plain}

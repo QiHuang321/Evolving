@@ -13,7 +13,8 @@ All numbers are on the 128-sample CharXiv descriptive validation subset with gre
 | `manual_thinking` | 0.5078 | 0.275 | Thinking model, suppressed CoT |
 | `evolved_instruct` | 0.6094 | 0.261 | Evolutionary search (40 gen) |
 | `evolved_thinking` | 0.5547 | 0.296 | Evolutionary search (Thinking) |
-| **`best_accuracy`** | **0.7969** | 0.307 | Evolved + bug fixes + title & colorbar verifiers |
+| **`best_accuracy`** | **0.7969** | 0.307 | Evolved v1 + bug fixes + title & colorbar verifiers |
+| `best_accuracy_v2` | 0.7578 | 0.648 | Evolved v2 (0.6094) + same fixes (back-port) |
 | **`best_overall`** | **0.7813** | 0.305 | Evolved + bug fixes + colorbar verifier |
 | `best_speed` | 0.5781 | 0.196±0.014 | Per-image batched inference, no preprocessing |
 
@@ -53,8 +54,12 @@ Evolved instruct      0.6094  ████████████
 ├── evolved_thinking.py          # Best program found by evolution (Thinking)
 │
 ├── best_accuracy.py             # Final submission: highest accuracy
+├── best_accuracy_v2.py          # Back-port: evolved v2 + all fixes (0.7578)
 ├── best_overall.py              # Final submission: best accuracy/speed balance
 ├── best_speed.py                # Final submission: fastest inference
+│
+├── ablation_no_archive.py       # Ablation: evolution without diversity archive
+├── ablation_no_cascade.py       # Ablation: evolution without cascaded evaluation
 │
 ├── evaluate.py                  # Evaluation harness (exact-match, 128 samples)
 ├── reproduce.sh                 # Run all evaluations
@@ -99,6 +104,17 @@ Evolved instruct      0.6094  ████████████
 - **Title verifier**: 3-view TTA for panel-marker detection (+1.6 pp over 0.6953 post-proc baseline)
 - **Colorbar verifier**: single-probe "Does this chart have a colorbar?" (+10.2 pp; applied after title verifier)
 
+### Ablation Analysis (retrospective, from evolution logs)
+- **Cascaded evaluation**: 9/29 candidates (31%) crashed; cascade saved ~35 min of wasted GPU time
+- **Diversity archive**: 13 unique behavior descriptors from 20 evaluations → diverse mutation inspiration
+- **Dual-mode mutation**: best-ever program (0.6094) found by focused mutation; full rewrites crash more often (33% vs 27%)
+
+### Instruct vs Thinking: Complementary Error Profiles
+Head-to-head on 128 samples: Instruct-only correct 26, Thinking-only correct 22, both wrong 37.
+- Instruct wins +24 on **value-extraction** questions (reads tick values, labels, intersections)
+- Thinking wins +18 on **absence-detection** (correctly returns "Not Applicable" for missing features)
+- Suggests an ensemble routing strategy as future work
+
 ## Quick Start
 
 ```bash
@@ -129,6 +145,10 @@ bash reproduce.sh
 export OPENAI_API_KEY="sk-..."
 python evolve_instruct.py
 python evolve_thinking.py
+
+# Run ablation experiments (requires OpenAI API key)
+python ablation_no_archive.py    # Evolution without diversity archive
+python ablation_no_cascade.py    # Evolution without cascaded evaluation
 ```
 
 ## Models
