@@ -30,9 +30,17 @@ echo "===== best_overall --cv 4 ====="
 python evaluate.py best_overall --cv 4
 echo
 
-# ── Speed benchmark (5 repeated runs) ─────────────────────────────────────────
-echo "===== best_speed timing (5 runs) ====="
-for i in 1 2 3 4 5; do
+echo "===== best_accuracy --cv 4 --grouped ====="
+python evaluate.py best_accuracy --cv 4 --grouped
+echo
+
+echo "===== best_overall --cv 4 --grouped ====="
+python evaluate.py best_overall --cv 4 --grouped
+echo
+
+# ── Speed benchmark (6 repeated runs) ────────────────────────────────────────
+echo "===== best_speed timing (6 runs) ====="
+for i in 1 2 3 4 5 6; do
   echo "--- run $i ---"
   python evaluate.py best_speed
 done

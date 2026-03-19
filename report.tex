@@ -702,7 +702,9 @@ this is a stability check rather than true cross-validation (which would
 require re-deriving verifiers on $K{-}1$ folds and testing on the held-out fold).
 The evaluator also supports grouped-by-figure folds
 (\texttt{-{}-grouped}), where all four questions for each chart stay in
-the same fold, preventing information leaking across fold boundaries.
+the same fold and figures are distributed across folds via round-robin
+over question-type buckets (grouped + stratified), preventing both
+information leaking and question-type imbalance across fold boundaries.
 Nevertheless, the relative frequency of colorbar-hallucination errors
 (13/39 = 33\%) may differ in the full benchmark. The cleaner measure of our
 system's generalisation ability is the manual$\to$evolved chain

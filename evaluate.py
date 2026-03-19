@@ -9,7 +9,8 @@ by image and calls the batch path for better throughput.
 
 Extra modes:
   --cv 4            Run 4-fold stability check and report per-fold + mean accuracy.
-  --cv 4 --grouped  Same, but folds are grouped by figure_id (no image leaks across folds).
+  --cv 4 --grouped  Same, but folds are grouped by figure_id AND stratified by
+                    question type so each fold has a balanced mix.
   --fold K/N        Evaluate only on fold K of N (e.g. --fold 2/4 for the second quarter).
 """
 import importlib
@@ -24,6 +25,70 @@ CHARXIV_PATH = Path(__file__).parent / "charxiv"
 sys.path.insert(0, str(CHARXIV_PATH / "src"))
 
 from descriptive_utils import build_descriptive_quries
+
+
+def _classify_question(question: str) -> str:
+    """Map a question to a coarse type for stratified splitting."""
+    q = " ".join(question.lower().split())
+    if "continuous legend" in q:
+        return "colorbar"
+    if "legend" in q:
+        return "legend"
+    if "layout of the subplots" in q or "number of subplots" in q:
+        return "layout"
+    if any(p in q for p in ["leftmost", "rightmost", "lowest", "highest",
+                            "tick values", "tick labels", "how many"]):
+        return "numeric"
+    if "title" in q:
+        return "title"
+    if "label of the" in q or "axis" in q:
+        return "axis"
+    if "trend" in q or "intersect" in q:
+        return "trend"
+    return "other"
+
+
+def _figure_dominant_type(queries, figure_id, all_keys):
+    """Return the most common question type for a figure (used for stratified grouping)."""
+    from collections import Counter
+    types = []
+    for k in all_keys:
+        if k.split("_")[0] == figure_id:
+            types.append(_classify_question(queries[k]["question"]))
+    if not types:
+        return "other"
+    return Counter(types).most_common(1)[0][0]
+
+
+def _grouped_stratified_fold_keys(queries, all_keys, fold, num_folds):
+    """Assign figures to folds via round-robin over question-type buckets.
+
+    1. Classify each figure by its dominant question type.
+    2. Within each type bucket, assign figures to folds via round-robin.
+    3. Return the query keys belonging to the requested fold.
+
+    This ensures:
+    - All 4 questions for a given chart stay in the same fold (grouped).
+    - Each fold gets an approximately balanced mix of question types (stratified).
+    """
+    # Get unique figure IDs in order
+    figure_ids = list(OrderedDict.fromkeys(k.split("_")[0] for k in all_keys))
+
+    # Classify each figure
+    type_buckets = {}  # type -> [fig_id, ...]
+    for fig_id in figure_ids:
+        dtype = _figure_dominant_type(queries, fig_id, all_keys)
+        type_buckets.setdefault(dtype, []).append(fig_id)
+
+    # Round-robin assign figures to folds within each type bucket
+    fold_figures = [set() for _ in range(num_folds)]
+    for dtype in sorted(type_buckets.keys()):
+        for i, fig_id in enumerate(type_buckets[dtype]):
+            fold_figures[i % num_folds].add(fig_id)
+
+    # Return keys for the requested fold (1-indexed)
+    target_figs = fold_figures[fold - 1]
+    return set(k for k in all_keys if k.split("_")[0] in target_figs)
 
 
 def load_charxiv_data(num_samples=128):
@@ -44,13 +109,8 @@ def evaluate(program, fold=None, num_folds=None, grouped=False):
     if fold is not None and num_folds is not None:
         all_keys = list(queries.keys())
         if grouped:
-            # Group by figure_id so all questions for one chart stay in the same fold.
-            figure_ids = list(OrderedDict.fromkeys(k.split("_")[0] for k in all_keys))
-            figs_per_fold = len(figure_ids) // num_folds
-            start_fig = (fold - 1) * figs_per_fold
-            end_fig = figs_per_fold * fold if fold < num_folds else len(figure_ids)
-            fold_figs = set(figure_ids[start_fig:end_fig])
-            fold_keys = set(k for k in all_keys if k.split("_")[0] in fold_figs)
+            # Grouped by figure_id + stratified by question type.
+            fold_keys = _grouped_stratified_fold_keys(queries, all_keys, fold, num_folds)
         else:
             fold_size = len(all_keys) // num_folds
             start_idx = (fold - 1) * fold_size

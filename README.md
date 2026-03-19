@@ -1,48 +1,54 @@
 # Evolving VLM Inference for CharXiv
 
-> AlphaEvolve-style code optimization for chart question answering with Qwen3-VL-2B.
+> AlphaEvolve-style optimization of Qwen3-VL-2B for chart question answering.
 >
-> **Evolution-only:** 38.3% → 60.9% dev exact-match (no per-sample inspection).
-> **Post-analysis dev-best:** 79.7% exact-match (colorbar verifier).
-> **Best warm-start speed:** 0.196 ± 0.014 s/query.
+> **Evolution-only:** 38.3 → 60.9 dev exact-match
+> **Post-analysis dev-best:** 79.7 dev exact-match
+> **Best warm-start latency:** 0.196 ± 0.014 s/query
 
-[Paper (PDF)](./report.pdf) · [Reproduce](#reproduce) · [Results](#main-results) · [Method](#method) · [Limitations](#limitations)
+<p align="center">
+  <img src="assets/teaser.png" alt="Evolving VLM Inference for CharXiv" width="920"/>
+</p>
+
+<p align="center">
+  <a href="./report.pdf">Paper</a> ·
+  <a href="#main-results">Results</a> ·
+  <a href="#method">Method</a> ·
+  <a href="#reproduce">Reproduce</a> ·
+  <a href="#limitations">Limitations</a>
+</p>
 
 ## TL;DR
 
-- We implement an **AlphaEvolve-style mutation–evaluation–selection loop** that evolves the Python `vlm_inference` function for chart QA.
-- Evolution alone improves the teacher baseline from **0.3828** to **0.6094** — a clean +22.7 pp gain with no per-sample inspection.
-- Manual post-processing bug fixes push accuracy to **0.6953** (+8.6 pp).
-- A targeted **colorbar-existence verifier** fixes the largest remaining hallucination mode and reaches **0.7969** on the 128-sample dev subset.
-- An **Instruct/Thinking question-type router** was attempted but is a **negative result** (0.75): the colorbar verifier already absorbs the Thinking model's NA-detection advantage.
-- All headline numbers are on a **128-example development subset**; held-out performance may differ.
+- This repository optimizes **code**, not just prompts: an AlphaEvolve-style loop mutates and evaluates the Python `vlm_inference` function for chart QA.
+- Evolution alone improves the teacher baseline from **0.3828** to **0.6094** on the 128-example CharXiv dev subset.
+- Post-processing fixes and targeted verifiers push the best dev result to **0.7969**.
+- The key empirical finding is that **narrow binary verifiers** are more reliable than direct uncertain value extraction.
+- All headline numbers are on a **development subset**. Held-out performance may differ.
 
 ## Main Results
 
-All numbers are on the 128-sample CharXiv descriptive validation subset with greedy decoding.
+All numbers below use greedy decoding on the 128-example CharXiv descriptive validation subset.
 
-| Variant | Accuracy | Time (s/q) | What changed |
+| Variant | Accuracy | Time (s/query) | What changed |
 | --- | ---: | ---: | --- |
 | `starting_scripts` | 0.3828 | 3.484 | teacher baseline |
 | `manual_instruct` | 0.5391 | 0.269 | prompt + normalization |
-| `evolved_instruct` | 0.6094 | 0.261 | **evolution only** (40 gen) |
-| `best_accuracy` | **0.7969** | 0.307 | evolved v1 + post-proc fixes + verifiers |
-| `best_accuracy_v3` | 0.7500 | 0.730 | Instruct/Thinking router (**negative result**) |
-| `best_overall` | 0.7813 | 0.305 | accuracy/speed balance |
-| `best_speed` | 0.5781 | 0.196 ± 0.014† | per-image batched, warm-start |
+| `evolved_instruct` | 0.6094 | 0.261 | evolution only |
+| `best_accuracy` | **0.7969** | 0.307 | post-processing + targeted verifiers |
+| `best_overall` | **0.7813** | 0.305 | best accuracy/speed tradeoff |
+| `best_speed` | 0.5781 | **0.196 ± 0.014** | batched warm-start path |
 
-<sub>†Warm-start mean±std over 6 back-to-back runs; single cold-start run: 0.46–0.55 s/query.</sub>
+<sub>Warm-start mean±std over 6 back-to-back runs; cold-start: 0.46–0.55 s/query.</sub>
 
 ### Two-Layer Headline
 
-We report results in two tiers to separate evolution-driven gains from post-analysis tuning:
+To separate generalizable improvement from dev-set tuning, results are reported in two tiers:
 
-| Tier | Range | How |
+| Tier | Range | Interpretation |
 | --- | --- | --- |
-| **Evolution-only** | 0.3828 → 0.6094 | LLM mutation loop, no per-sample inspection |
-| **Post-analysis dev-best** | 0.6094 → 0.7969 | manual error analysis, verifiers |
-
-The evolution-only chain is the more conservative generalization estimate. The post-analysis gains carry inherent overfitting risk to the 128-sample dev set.
+| Evolution-only | 0.3828 → 0.6094 | cleaner estimate of search-driven gain |
+| Post-analysis dev-best | 0.6094 → 0.7969 | stronger dev performance, but with higher overfitting risk |
 
 ### 4-Fold Stability Check
 
@@ -53,57 +59,42 @@ Same fixed program evaluated on non-overlapping quarters (not re-derived per fol
 | `best_accuracy` | 0.797 ± 0.031 | 0.8125, 0.7500, 0.8125, 0.8125 |
 | `best_overall` | 0.781 ± 0.026 | 0.7813, 0.7500, 0.8125, 0.7813 |
 
-Grouped-by-figure CV (via `--grouped`) is also supported — see [Reproduce](#reproduce).
+Grouped-by-figure, stratified-by-question-type CV (`--grouped`) is also supported — see [Reproduce](#reproduce).
 
-## Why This Works
+## Key Findings
 
-1. **Exact-match chart QA is bottlenecked by formatting and hallucination**, not raw perception. Post-processing fixes alone yield +8.6 pp.
-2. **Evolution discovers better prompts and normalization** than manual tuning: expanded NA synonyms, "answer is" extractors, question-type gating.
-3. **Narrow binary verifiers** ("does a colorbar exist?") are far more reliable than direct value extraction from uncertain visual objects — a single probe corrects 13/39 remaining errors.
-4. **Verifier-augmented prompting absorbs multi-model advantages**: Instruct+colorbar-verifier scores 16/16 on continuous-legend questions, eliminating the gap that motivated a Thinking-model router (negative result, see `best_accuracy_v3.py`).
+1. **Evolution beats manual tuning.**
+   The largest clean gain comes from mutating and selecting inference programs rather than only editing prompts by hand.
+
+2. **Exact-match chart QA is bottlenecked by formatting and hallucination.**
+   Post-processing fixes alone recover substantial accuracy.
+
+3. **Verifier design matters more than multi-model routing.**
+   A targeted colorbar-existence verifier closes the error mode that originally motivated an Instruct/Thinking router.
+
+4. **Negative results are informative.**
+   An Instruct/Thinking router was implemented (`best_accuracy_v3.py`, 0.7500) but underperformed the verifier-augmented single-model path (0.7969). The colorbar verifier already absorbs the Thinking model's NA-detection advantage.
 
 ## Method
 
-### Evolution System (`evolve_instruct.py`)
+### Evolution System
 
-```
+```text
 Population → Tournament Selection → LLM Mutation → Cascaded Evaluation → Archive → Population
                                         ↑                                    |
-                                        └─── archive inspiration ────────────┘
+                                        └──────── archive inspiration ────────┘
 ```
 
-- **LLM-guided mutation**: GPT-5.2-codex generates code variants (50% full-block rewrite, 50% focused single-function edit via `ast.parse()`)
-- **Cascaded evaluation**: regression tests → 1-sample crash check → 16-sample stratified pre-screen → full 128-sample eval
-- **Shared model injection**: VLM loaded once, injected into candidates post-`exec_module`
-- **Behavioral diversity archive**: MAP-Elites grid indexed by per-question-type accuracy bins + NA precision/recall
-- **Island model**: 2 islands × 4 programs, periodic migration
+- **LLM-guided mutation:** dual-mode edits (full-block rewrites and focused function edits)
+- **Cascaded evaluation:** regression tests → crash check → stratified pre-screen → full evaluation
+- **Shared model injection:** load the VLM once and inject it into candidate programs
+- **Behavioral diversity archive:** archive candidates by behavioral signatures, not only scalar score
+- **Island model:** parallel sub-populations with periodic migration
 
-### Post-Processing Bug Fixes (+8.6 pp)
+### Targeted Verifiers
 
-1. Negative sign stripping in candidate extraction
-2. Positional tick text fallback (non-numeric tick labels)
-3. Embedded number regex over-extraction
-4. Caret scientific notation preservation (`10^-6`)
-5. Legend count deduplication from label lists
-
-### Targeted Verifiers (+10.2 pp)
-
-- **Title verifier**: 3-view TTA for panel-marker detection
-- **Colorbar verifier**: single-probe "Does this chart have a colorbar?"
-
-### Question-Type Router (`best_accuracy_v3.py`) — Negative Result
-
-Instruct and Thinking models have complementary error profiles on *unverified* outputs:
-
-| Category | Instruct-only correct | Thinking-only correct |
-| --- | ---: | ---: |
-| Value extraction (ticks, labels) | 24 | 4 |
-| Absence detection (NA) | 2 | 18 |
-| **Total** | **26** | **22** |
-
-A router was built using the Thinking model for continuous-legend questions (where absence-detection dominates). However, with the colorbar verifier already in place, Instruct scores **16/16** on continuous-legend questions, leaving no room for Thinking to help. The router scores **0.7500** — worse than `best_accuracy` (0.7969) because Thinking's weaker value-extraction hurts on the 6 questions it incorrectly answers.
-
-**Lesson:** verifier-augmented prompting can absorb the accuracy gap that would otherwise motivate a multi-model router.
+- **Title verifier:** panel-marker robustness via simple test-time augmentation
+- **Colorbar verifier:** a narrow yes/no probe that is more reliable than direct uncertain visual extraction
 
 ### Ablation ([details in report](./report.pdf))
 
@@ -114,17 +105,16 @@ A router was built using the Thinking model for continuous-legend questions (whe
 ## Reproduce
 
 ```bash
-# Setup
 pip install -r requirements.txt
 # Download CharXiv images into charxiv/images/ (see charxiv/images/README.md)
 
-# Core evaluations
-python evaluate.py best_accuracy           # single run
-python evaluate.py best_accuracy --cv 4    # 4-fold stability
-python evaluate.py best_accuracy --cv 4 --grouped  # grouped-by-figure folds
-
-# Full benchmark (all variants + speed loop)
+# Full benchmark (all variants + grouped CV + speed loop)
 bash reproduce.sh
+
+# Individual evaluations
+python evaluate.py best_accuracy                      # single run
+python evaluate.py best_accuracy --cv 4               # 4-fold stability (sequential)
+python evaluate.py best_accuracy --cv 4 --grouped     # 4-fold grouped-by-figure + stratified
 
 # Re-run evolution (requires OPENAI_API_KEY)
 export OPENAI_API_KEY="sk-..."
@@ -134,16 +124,26 @@ python evolve_thinking.py
 
 ## Limitations
 
-- **Dev-subset tuning risk**: post-processing fixes and verifiers were developed by analysing errors on the same 128-sample set used for evaluation. The evolution-only chain (38.3%→60.9%) is the more conservative generalization estimate.
-- **Back-port gap**: post-processing tuned against the v1 evolved base does not transfer perfectly to v2 (0.7969 vs 0.7578), confirming partial base-specificity.
-- **Single mutation model**: we use only GPT-5.2-codex; AlphaEvolve uses multi-model ensembles.
-- **Single weighted scalar**: accuracy + speed are collapsed into one score instead of Pareto multi-objective.
-- **128-sample evaluation**: all reported numbers are on a small dev subset; the held-out test set may show different patterns.
+- All headline numbers are from a **128-example development subset**.
+- The **post-analysis dev-best** tier includes manual error analysis and therefore carries overfitting risk.
+- The 4-fold check evaluates **fixed programs** across folds; it is not nested cross-validation.
+- Grouped-by-figure evaluation is more conservative than naive contiguous folds and should be preferred for reporting stability.
 
-## Repository Structure
+## Repository Guide
+
+| File | Role |
+| --- | --- |
+| `evolve_instruct.py` | main AlphaEvolve-style search loop |
+| `evolved_instruct.py` | best evolution-only program (0.6094) |
+| `best_accuracy.py` | strongest dev result (0.7969) |
+| `best_accuracy_v3.py` | Instruct/Thinking router — negative result (0.7500) |
+| `best_overall.py` | best accuracy/speed balance (0.7813) |
+| `best_speed.py` | batched fast path (0.196 s/q warm-start) |
+| `evaluate.py` | evaluation and CV driver (`--cv`, `--fold`, `--grouped`) |
+| `report.pdf` | paper/report |
 
 <details>
-<summary>File tree (click to expand)</summary>
+<summary>Full file tree (click to expand)</summary>
 
 ```
 ├── starting_scripts.py         # Teacher baseline
@@ -153,7 +153,7 @@ python evolve_thinking.py
 ├── evolve_thinking.py          # Evolution system (Thinking)
 ├── evolved_instruct.py         # Best evolved program (Instruct, 0.6094)
 ├── evolved_thinking.py         # Best evolved program (Thinking, 0.5547)
-├── best_accuracy.py            # Highest accuracy: evolved v1 + fixes + verifiers (0.7969)
+├── best_accuracy.py            # Highest accuracy (0.7969)
 ├── best_accuracy_v2.py         # Back-port: evolved v2 + same fixes (0.7578)
 ├── best_accuracy_v3.py         # Instruct/Thinking router — negative result (0.7500)
 ├── best_overall.py             # Best accuracy/speed tradeoff (0.7813)
@@ -166,6 +166,8 @@ python evolve_thinking.py
 ├── report.tex / report.pdf     # NeurIPS-format paper
 ├── LICENSE                     # MIT
 ├── CITATION.cff                # Citation metadata
+├── assets/
+│   └── teaser.png              # Teaser figure for README
 └── charxiv/                    # CharXiv benchmark data + eval code
     ├── data/                   #   JSON question/answer files
     ├── images/                 #   Chart images (download separately)
@@ -184,6 +186,8 @@ python evolve_thinking.py
 [MIT](LICENSE)
 
 ## Citation
+
+Please use the metadata in [`CITATION.cff`](CITATION.cff), or:
 
 ```bibtex
 @software{huang2026evolving,
