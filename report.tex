@@ -338,6 +338,7 @@ Variant & Accuracy & Time (s/query) & Notes \\
 \midrule
 \texttt{best\_accuracy}    & \textbf{0.7969} & 0.307 & evolved v1 + fixes + title \& colorbar verifiers \\
 \texttt{best\_accuracy\_v2}& 0.7578 & 0.648 & evolved v2 (0.6094) + same fixes (back-port) \\
+\texttt{best\_accuracy\_v3}& 0.7500 & 0.730 & Instruct/Thinking router (\emph{negative result}) \\
 \texttt{best\_speed}       & 0.5781 & 0.196$\pm$0.014 & batched inference, no image preprocessing$^\dagger$ \\
 \texttt{best\_overall}     & 0.7813 & 0.305 & evolved + fixes + colorbar verifier \\
 \bottomrule
@@ -487,11 +488,24 @@ Instruct masks a pronounced \emph{complementary error profile}:
     Instruct model hallucinates values.
 \end{itemize}
 In other words, the 2B Thinking model's caution is a \emph{liability} for
-value extraction but an \emph{asset} for absence detection. This suggests
-that an ensemble routing strategy---using the Thinking model as a
-``null-hypothesis verifier'' and the Instruct model for value extraction---could
-combine both strengths, though we did not implement this due to the added
-latency of running two models.
+value extraction but an \emph{asset} for absence detection.
+
+\paragraph{Question-type router (negative result).}
+Motivated by these complementary profiles, we implemented a question-type
+router (\texttt{best\_accuracy\_v3.py}) that routes continuous-legend
+questions (where absence-detection dominates) to the Thinking model and
+all other questions to the Instruct pipeline.  The result:
+\textbf{0.7500}---\emph{worse} than \texttt{best\_accuracy} (0.7969).
+The reason: the colorbar-existence verifier (\S\ref{sec:colorbar}) already
+captures the NA-detection advantage that Thinking offered in the
+\emph{unverified} comparison.  Instruct + colorbar verifier scores 16/16
+on continuous-legend questions, leaving no room for Thinking to help.
+Routing those 16 questions to the Thinking model loses 6 due to its
+weaker value extraction.
+
+\textbf{Lesson:} verifier-augmented prompting can absorb the accuracy gap
+that would otherwise motivate a multi-model router.  This finding further
+validates the colorbar verifier as the more efficient intervention.
 
 \paragraph{Test-time augmentation (TTA).}
 We explored multi-view TTA---generating answers from multiple image
@@ -686,6 +700,9 @@ $0.781 \pm 0.026$. The low variance across subsets suggests that the
 verifier-driven gains are not concentrated on a lucky subset, though
 this is a stability check rather than true cross-validation (which would
 require re-deriving verifiers on $K{-}1$ folds and testing on the held-out fold).
+The evaluator also supports grouped-by-figure folds
+(\texttt{-{}-grouped}), where all four questions for each chart stay in
+the same fold, preventing information leaking across fold boundaries.
 Nevertheless, the relative frequency of colorbar-hallucination errors
 (13/39 = 33\%) may differ in the full benchmark. The cleaner measure of our
 system's generalisation ability is the manual$\to$evolved chain
@@ -712,10 +729,10 @@ closer to the full AlphaEvolve architecture.  Batched inference would further re
 generation. On the verification side, extending the targeted-probe strategy
 beyond colorbar to other hallucination-prone question types (e.g.\ tick
 counting, discrete legend existence) could close additional error categories.
-The complementary error profiles of Instruct and Thinking models (\S6)
-suggest an ensemble routing strategy: use the Thinking model's caution as a
-null-hypothesis verifier and the Instruct model for value extraction, combining
-both strengths without retraining.
+An Instruct/Thinking question-type router was implemented
+(\texttt{best\_accuracy\_v3.py}) but proved to be a negative result
+(0.7500 vs.\ 0.7969): the colorbar verifier already absorbs the Thinking
+model's NA-detection advantage, making the router redundant (see \S6).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Conclusion}
@@ -732,9 +749,10 @@ evolution logs shows that cascaded evaluation saved $\sim$35 minutes of wasted
 GPU time by catching 31\% of candidates that crashed at runtime, and the
 behavioral diversity archive preserved 13 distinct solution strategies across
 20 evaluations.  A head-to-head analysis reveals that Instruct and Thinking
-models have complementary error profiles (+24 vs +18 on value-extraction
-vs.\ absence-detection questions), suggesting an ensemble routing strategy
-as future work.  Back-porting the post-processing fixes to a newer evolved
+models have complementary error profiles (+24 vs.\ +18 on value-extraction
+vs.\ absence-detection questions), but an implemented question-type router
+(\texttt{best\_accuracy\_v3}, 0.7500) showed that the colorbar verifier
+already absorbs this gap---a notable negative result.  Back-porting the post-processing fixes to a newer evolved
 base yielded 0.7578 rather than 0.7969, highlighting that manual
 post-processing improvements are partially base-specific.
 

@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Evolving VLM Inference for CharXiv"
+type: software
+authors:
+  - family-names: Huang
+    given-names: Qi
+    affiliation: "The University of Chicago"
+    email: qihuang@uchicago.edu
+repository-code: "https://github.com/QiHuang321/Evolving"
+license: MIT
+date-released: "2026-03-19"
+abstract: >-
+  AlphaEvolve-style evolutionary code optimization for VLM chart question
+  answering on the CharXiv benchmark. Evolution alone improves a naive
+  baseline from 38.3% to 60.9% exact-match accuracy; subsequent post-analysis
+  post-processing and targeted verifiers reach 79.7% on the 128-sample
+  development subset.
+keywords:
+  - vision-language-model
+  - chart-question-answering
+  - evolutionary-search
+  - alphaevolve
+  - charxiv
+  - qwen

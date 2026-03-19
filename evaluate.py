@@ -8,8 +8,9 @@ If the loaded module exposes vlm_inference_batch, the evaluator groups queries
 by image and calls the batch path for better throughput.
 
 Extra modes:
-  --cv 4         Run 4-fold stability check and report per-fold + mean accuracy.
-  --fold K/N     Evaluate only on fold K of N (e.g. --fold 2/4 for the second quarter).
+  --cv 4            Run 4-fold stability check and report per-fold + mean accuracy.
+  --cv 4 --grouped  Same, but folds are grouped by figure_id (no image leaks across folds).
+  --fold K/N        Evaluate only on fold K of N (e.g. --fold 2/4 for the second quarter).
 """
 import importlib
 import sys
@@ -34,7 +35,7 @@ def load_charxiv_data(num_samples=128):
     return queries, data
 
 
-def evaluate(program, fold=None, num_folds=None):
+def evaluate(program, fold=None, num_folds=None, grouped=False):
     NUM_SAMPLES = 128
 
     queries, ground_truth_data = load_charxiv_data(NUM_SAMPLES)
@@ -42,10 +43,19 @@ def evaluate(program, fold=None, num_folds=None):
     # If fold is specified, restrict to that fold's samples.
     if fold is not None and num_folds is not None:
         all_keys = list(queries.keys())
-        fold_size = len(all_keys) // num_folds
-        start_idx = (fold - 1) * fold_size
-        end_idx = fold_size * fold if fold < num_folds else len(all_keys)
-        fold_keys = set(all_keys[start_idx:end_idx])
+        if grouped:
+            # Group by figure_id so all questions for one chart stay in the same fold.
+            figure_ids = list(OrderedDict.fromkeys(k.split("_")[0] for k in all_keys))
+            figs_per_fold = len(figure_ids) // num_folds
+            start_fig = (fold - 1) * figs_per_fold
+            end_fig = figs_per_fold * fold if fold < num_folds else len(figure_ids)
+            fold_figs = set(figure_ids[start_fig:end_fig])
+            fold_keys = set(k for k in all_keys if k.split("_")[0] in fold_figs)
+        else:
+            fold_size = len(all_keys) // num_folds
+            start_idx = (fold - 1) * fold_size
+            end_idx = fold_size * fold if fold < num_folds else len(all_keys)
+            fold_keys = set(all_keys[start_idx:end_idx])
         queries = {k: v for k, v in queries.items() if k in fold_keys}
 
     num_errors = 0
@@ -121,6 +131,8 @@ def main():
                         help="Run K-fold stability check (e.g. --cv 4)")
     parser.add_argument("--fold", type=str, default=None, metavar="K/N",
                         help="Evaluate on fold K of N (e.g. --fold 2/4)")
+    parser.add_argument("--grouped", action="store_true",
+                        help="Group folds by figure_id (all questions for one chart in same fold)")
     args = parser.parse_args()
 
     program = importlib.import_module(args.module_name)
@@ -129,16 +141,18 @@ def main():
         # K-fold cross-validation
         fold_results = []
         for k in range(1, args.cv + 1):
-            print(f"\n--- Fold {k}/{args.cv} ---")
-            result = evaluate(program, fold=k, num_folds=args.cv)
+            print(f"\n--- Fold {k}/{args.cv}{' (grouped)' if args.grouped else ''} ---")
+            result = evaluate(program, fold=k, num_folds=args.cv, grouped=args.grouped)
             fold_results.append(result)
             print(f"  Accuracy: {result['accuracy']:.4f} ({result['num_evaluated']} samples)")
         accuracies = [r["accuracy"] for r in fold_results]
         mean_acc = sum(accuracies) / len(accuracies)
         import statistics
         std_acc = statistics.stdev(accuracies) if len(accuracies) > 1 else 0.0
-        print(f"\n=== {args.cv}-fold CV: {mean_acc:.4f} ± {std_acc:.4f} ===")
-        print(json.dumps({"cv_folds": args.cv, "per_fold": accuracies,
+        mode_label = "grouped" if args.grouped else "sequential"
+        print(f"\n=== {args.cv}-fold CV ({mode_label}): {mean_acc:.4f} ± {std_acc:.4f} ===")
+        print(json.dumps({"cv_folds": args.cv, "grouped": args.grouped,
+                          "per_fold": accuracies,
                           "mean": mean_acc, "std": std_acc}, indent=2))
     elif args.fold:
         k, n = map(int, args.fold.split("/"))
