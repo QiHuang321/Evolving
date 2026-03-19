@@ -58,9 +58,10 @@ that 13 of 39 remaining errors stem from the model hallucinating continuous
 legend (colorbar) values on charts that have none; a targeted one-shot colorbar
 verifier probe corrects all 13, pushing accuracy to \textbf{79.7\%}---a 41.4
 percentage point improvement over the baseline.
-Four-fold cross-validation on the 128 development samples yields
-$0.797 \pm 0.031$ for \texttt{best\_accuracy}, confirming that the
-verifier gains are not overfit to a specific subset.
+A four-fold stability check on the 128 development samples yields
+$0.797 \pm 0.031$ for \texttt{best\_accuracy}, suggesting that the
+verifier gains are robust across subsets (though this evaluates the
+same fixed program, not re-derived verifiers per fold).
 These results show that
 systematic error categorization and lightweight targeted verification can
 substantially outperform sophisticated inference techniques when the bottleneck
@@ -263,9 +264,11 @@ candidate.
 To avoid reloading the 2B-parameter VLM for every candidate evaluation, the
 evolution harness loads the model once at startup and injects the
 \texttt{\_MODEL} and \texttt{\_PROCESSOR} objects into each candidate's module
-namespace before executing it.  Candidates that define \texttt{\_MODEL = None}
-(the standard pattern) receive the pre-loaded model and skip their own
-\texttt{from\_pretrained} call, reducing per-candidate evaluation overhead from
+namespace \emph{after} executing it (i.e.\ after \texttt{exec\_module}), so
+that the candidate's own \texttt{\_MODEL = None} initialiser runs first and is
+then overridden by the shared reference.  The candidate's
+\texttt{from\_pretrained} guard (\texttt{if \_MODEL is None}) therefore never
+triggers, reducing per-candidate evaluation overhead from
 $\sim$25\,s of model loading to near zero.
 
 \paragraph{Evolution loop.}
@@ -296,7 +299,7 @@ Variant & Accuracy & Time (s/query) & Notes \\
 \texttt{evolved\_thinking} & 0.5547 & 0.296 & evolved improvement over manual thinking \\
 \midrule
 \texttt{best\_accuracy}    & \textbf{0.7969} & 0.307 & evolved + fixes + title \& colorbar verifiers \\
-\texttt{best\_speed}       & 0.5781 & 0.339$\pm$0.008 & batched inference, no image preprocessing$^\dagger$ \\
+\texttt{best\_speed}       & 0.5781 & 0.196$\pm$0.014 & batched inference, no image preprocessing$^\dagger$ \\
 \texttt{best\_overall}     & 0.7813 & 0.305 & evolved + fixes + colorbar verifier \\
 \bottomrule
 \end{tabular}
@@ -304,8 +307,8 @@ Variant & Accuracy & Time (s/query) & Notes \\
 \smallskip
 {\small $^\dagger$Batched path processes 4 questions per forward pass.
 Timing is
-warm-start mean$\pm$std over 4 back-to-back runs
-(cold-start first run excluded; cold-start = 0.280~s/query).
+warm-start mean$\pm$std over 6 back-to-back runs
+(cold-start first run excluded; cold-start = 0.549~s/query).
 All timing starts before the first inference call and stops after the last.}
 \end{table}
 
@@ -482,9 +485,10 @@ All timing numbers in Table~\ref{tab:results} are end-to-end wall-clock
 measurements from \texttt{evaluate.py}, which starts the timer before the
 first inference call and stops it after the last.
 For the single-query variants we report a single representative run.
-For \texttt{best\_speed} we report the mean$\pm$std of 4 consecutive
+For \texttt{best\_speed} we report the mean$\pm$std of 6 consecutive
 warm-start runs (excluding a cold-start first run that includes one-time
-model loading): \textbf{0.339$\pm$0.008~s/query} (cold-start: 0.280~s/query).
+model and CUDA-kernel caching): \textbf{0.196$\pm$0.014~s/query}
+(cold-start: 0.549~s/query).
 The evaluator includes a length check
 (\texttt{len(responses) == len(questions)}) to ensure batched results are
 never silently truncated.
@@ -561,11 +565,14 @@ evaluation. While the fixes are question-type-based rather than
 sample-specific (e.g.\ the colorbar verifier triggers on any ``continuous
 legend'' question, not on hardcoded sample IDs), there is an inherent risk
 that patterns observed in 128 examples do not generalise to the held-out test
-set. To quantify this risk, we run 4-fold cross-validation on the 128
-samples: \texttt{best\_accuracy} scores $0.797 \pm 0.031$ (per-fold:
+set. To quantify this risk, we partition the 128 samples into four
+non-overlapping folds and evaluate the \emph{same fixed program} on each.
+\texttt{best\_accuracy} scores $0.797 \pm 0.031$ (per-fold:
 0.8125, 0.7500, 0.8125, 0.8125) and \texttt{best\_overall} scores
-$0.781 \pm 0.026$. The low variance across folds indicates that the
-verifier-driven gains are not concentrated on a lucky subset.
+$0.781 \pm 0.026$. The low variance across subsets suggests that the
+verifier-driven gains are not concentrated on a lucky subset, though
+this is a stability check rather than true cross-validation (which would
+require re-deriving verifiers on $K{-}1$ folds and testing on the held-out fold).
 Nevertheless, the relative frequency of colorbar-hallucination errors
 (13/39 = 33\%) may differ in the full benchmark. The cleaner measure of our
 system's generalisation ability is the manual$\to$evolved chain

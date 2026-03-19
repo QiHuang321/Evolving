@@ -205,12 +205,13 @@ def evaluate_program(program: Program, parent_accuracy: float = 0.0) -> Program:
         spec = importlib.util.spec_from_file_location("_evolved_candidate", tmp_path)
         mod = importlib.util.module_from_spec(spec)
 
-        # Inject shared model so candidates don't reload from scratch
+        spec.loader.exec_module(mod)
+
+        # Inject shared model AFTER exec so the candidate's top-level
+        # _MODEL = None doesn't overwrite our reference.
         if _SHARED_MODEL is not None:
             mod._MODEL = _SHARED_MODEL
             mod._PROCESSOR = _SHARED_PROCESSOR
-
-        spec.loader.exec_module(mod)
 
         # ── Phase 0: Regression tests ──
         if parent_accuracy > 0 and hasattr(mod, '_normalize_answer'):

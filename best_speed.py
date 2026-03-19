@@ -312,7 +312,7 @@ def vlm_inference(image_path, question="Describe this image in detail."):
 
 def vlm_inference_batch(image_path, questions):
     """Batched inference: process multiple questions for the same image in one
-    forward pass.  The image is encoded once and shared across all questions,
+    forward pass.  Same-image questions are batched together with left-padding,
     saving ~75% of compute when there are 4 questions per image (CharXiv default).
 
     Args:

@@ -15,11 +15,12 @@ All numbers are on the 128-sample CharXiv descriptive validation subset with gre
 | `evolved_thinking` | 0.5547 | 0.296 | Evolutionary search (Thinking) |
 | **`best_accuracy`** | **0.7969** | 0.307 | Evolved + bug fixes + title & colorbar verifiers |
 | **`best_overall`** | **0.7813** | 0.305 | Evolved + bug fixes + colorbar verifier |
-| `best_speed` | 0.5781 | 0.339±0.008 | Per-image batched inference, no preprocessing |
+| `best_speed` | 0.5781 | 0.196±0.014 | Per-image batched inference, no preprocessing |
 
-### 4-Fold Cross-Validation
+### 4-Fold Stability Check
 
-To check for overfitting to the 128-sample dev set:
+To check whether gains are concentrated on a lucky subset (same fixed
+program evaluated on non-overlapping quarters — not re-derived per fold):
 
 | Variant | Mean ± Std | Per-fold |
 | --- | --- | --- |
@@ -27,6 +28,9 @@ To check for overfitting to the 128-sample dev set:
 | `best_overall` | 0.781 ± 0.026 | 0.7813, 0.7500, 0.8125, 0.7813 |
 
 ### Accuracy Progression
+
+Each row shows the cumulative accuracy along the `best_accuracy` branch
+(deltas are relative to the previous row, not a fixed baseline):
 
 ```
 Baseline              0.3828  ████████
@@ -91,9 +95,9 @@ Evolved instruct      0.6094  ████████████
 4. Caret scientific notation preservation (`10^-6`)
 5. Legend count deduplication from label lists
 
-### Targeted Verifiers (+11.8 pp)
-- **Title verifier**: 3-view TTA for panel-marker detection (+1.6 pp)
-- **Colorbar verifier**: single-probe "Does this chart have a colorbar?" (+10.2 pp)
+### Targeted Verifiers (+11.8 pp cumulative from post-proc fixes)
+- **Title verifier**: 3-view TTA for panel-marker detection (+1.6 pp over 0.6953 post-proc baseline)
+- **Colorbar verifier**: single-probe "Does this chart have a colorbar?" (+10.2 pp; applied after title verifier)
 
 ## Quick Start
 
@@ -101,16 +105,24 @@ Evolved instruct      0.6094  ████████████
 # Install dependencies
 pip install -r requirements.txt
 
+# Download CharXiv images (required for evaluation)
+cd charxiv/images
+# Option A: if you have the CharXiv images tarball
+tar xzf charxiv_images.tar.gz
+# Option B: download from the CharXiv repo
+#   See charxiv/images/README.md for instructions
+cd ../..
+
 # Evaluate a single script
 python evaluate.py best_accuracy
 
-# 4-fold cross-validation
+# 4-fold stability check
 python evaluate.py best_accuracy --cv 4
 
 # Evaluate on a specific fold
 python evaluate.py best_accuracy --fold 2/4
 
-# Run all evaluations
+# Run all evaluations (accuracy + stability + speed benchmark)
 bash reproduce.sh
 
 # Re-run evolution (requires OpenAI API key)

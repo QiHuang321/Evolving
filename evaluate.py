@@ -8,7 +8,7 @@ If the loaded module exposes vlm_inference_batch, the evaluator groups queries
 by image and calls the batch path for better throughput.
 
 Extra modes:
-  --cv 4         Run 4-fold cross-validation and report per-fold + mean accuracy.
+  --cv 4         Run 4-fold stability check and report per-fold + mean accuracy.
   --fold K/N     Evaluate only on fold K of N (e.g. --fold 2/4 for the second quarter).
 """
 import importlib
@@ -118,7 +118,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate VLM inference on CharXiv")
     parser.add_argument("module_name", help="Python module to evaluate")
     parser.add_argument("--cv", type=int, default=0, metavar="K",
-                        help="Run K-fold cross-validation (e.g. --cv 4)")
+                        help="Run K-fold stability check (e.g. --cv 4)")
     parser.add_argument("--fold", type=str, default=None, metavar="K/N",
                         help="Evaluate on fold K of N (e.g. --fold 2/4)")
     args = parser.parse_args()
